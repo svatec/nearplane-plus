@@ -1,4 +1,4 @@
-# Contributing to nearPlane ADSB Tracker
+# Contributing to nearPlane+ ADSB Tracker
 
 First off, thank you for considering contributing! Your help is appreciated.
 
