@@ -76,7 +76,7 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino`
 - Unknown types fall back to the API `desc` field, then to the ICAO code. Extend the tables `TYPE_NAMES` / `AIRLINES` in the source.
 
 ### 2.9 Buzzer on/off
-- Hold **BtnC** for 2 s to mute or unmute all sounds (startup beep, new-aircraft beep, alert sounds).
+- Hold **BtnC** for 0.75 s (750 ms) to mute or unmute all sounds (startup beep, new-aircraft beep, alert sounds).
 - A "Sound ON / Sound OFF" message is shown; while muted a crossed-out speaker icon appears next to the battery.
 - The setting is stored in flash and survives reboots; a settings reset restores sound ON.
 
@@ -86,9 +86,17 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino`
 - The built-in `USER_AGENT` constant is only a dummy fallback (`changeme@example.com`); it is not a valid contact.
 - To change a saved value, reset the settings and run the setup again.
 
-### 2.11 Other changes
+### 2.11 GPS module (optional)
+- Supports the M5Stack GPS Unit v1.1 (AT6668 + MAX2659) on the Grove port; the older AT6558 unit works as well.
+- Wire orientation (G32/G33) and baud rate (115200 / 9600) are detected automatically from valid NMEA sentences (checksum verified).
+- The live GPS position replaces the saved coordinates: the API query, distances, bearings and the radar map use it; a fix up to 10 min old is kept, then the saved position is used.
+- Setup form: latitude/longitude are prefilled from the GPS, new checkbox **Use GPS module if connected**.
+- Display indicator `GPS` (live fix) / `GPS?` (module found, no fix) below the clock; the serial log shows `gps=...` and the position source.
+
+### 2.12 Other changes
 - Page 5: the `CAT` row was replaced by `REG` (registration), because the header no longer shows it when the airline is known.
 - Route (`DEP > ARR`) is fetched only for the selected aircraft and only once.
+- BtnC hold time for the buzzer toggle shortened from 2 s to 0.75 s (750 ms).
 
 ## 3. Controls
 
@@ -97,7 +105,7 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino`
 | **BtnA** (front) short | next page | all pages |
 | **BtnA** long (0.6 s) | jump to detail of the selected aircraft (page 1) | radar map |
 | **BtnC** (power button, side) short | change map scale | radar map |
-| **BtnC** hold 2 s | buzzer on/off (saved) | all pages |
+| **BtnC** hold 0.75 s | buzzer on/off (saved) | all pages |
 | **BtnB** (side) short | next aircraft | all aircraft pages |
 | **BtnB** short | next aircraft **within current scale** | radar map |
 | **BtnB** hold 1 s → 5 s | countdown screen, then settings reset | everywhere (release early to cancel) |
@@ -134,7 +142,8 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 ## 6. Notes & limitations
 
 - The sketch must be saved as `nearPlane/nearPlane.ino` (folder name = file name), otherwise the linker reports undefined `setup`/`loop`.
-- The device has no compass: arrows and the map are always north-up.
+- The device has no compass: arrows and the map are always north-up, also when the GPS position changes.
+- The GPS needs a satellite fix (about 25 s outdoors); until then, or when no module is detected, the coordinates saved in setup are used.
 - adsb.lol requires a real contact in the User-Agent – enter it in the setup form (field **User-Agent**).
 - Radius is entered in nautical miles (1 NM = 1.852 km).
 - Stats and the clock need a working NTP connection.
@@ -212,7 +221,7 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - Neznámy typ sa nahradí poľom `desc` z API, potom ICAO kódom. Tabuľky `TYPE_NAMES` / `AIRLINES` môžeš rozšíriť v zdrojovom kóde.
 
 ### 2.9 Zapnutie/vypnutie bzučiaka
-- Podržaním **BtnC** na 2 s stlmíš alebo zapneš všetky zvuky (štartovací tón, nové lietadlo, alerty).
+- Podržaním **BtnC** na 0,75 s (750 ms) stlmíš alebo zapneš všetky zvuky (štartovací tón, nové lietadlo, alerty).
 - Zobrazí sa hlásenie „Sound ON / Sound OFF“; pri vypnutom zvuku je vedľa batérie prečiarknutý reproduktor.
 - Nastavenie sa ukladá do flash pamäte a prežije reštart; reset nastavení vráti zvuk zapnutý.
 
@@ -222,9 +231,17 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - Vstavaná konštanta `USER_AGENT` je už len dummy záloha (`changeme@example.com`) a nie je platný kontakt.
 - Uloženú hodnotu zmeníš resetom nastavení a novým spustením setupu.
 
-### 2.11 Ostatné zmeny
+### 2.11 GPS modul (voliteľný)
+- Podporuje M5Stack GPS Unit v1.1 (AT6668 + MAX2659) na porte Grove; funguje aj staršia jednotka s AT6558.
+- Orientácia vodičov (G32/G33) a rýchlosť (115200 / 9600 baud) sa zistia automaticky z platných NMEA viet (kontroluje sa kontrolný súčet).
+- Živá poloha z GPS nahradí uložené súradnice: dopyt na API, vzdialenosti, smery aj radar mapa ju používajú; fix starý do 10 min sa drží, potom sa použije uložená poloha.
+- Formulár nastavenia: zemepisná šírka a dĺžka sa predvyplnia z GPS, nový checkbox **Use GPS module if connected**.
+- Indikátor na displeji `GPS` (živý fix) / `GPS?` (modul nájdený, bez fixu) pod hodinami; sériový log ukazuje `gps=...` a zdroj polohy.
+
+### 2.12 Ostatné zmeny
 - Stránka 5: riadok `CAT` nahradený riadkom `REG` (registrácia), keďže ju hlavička pri známej aerolínii už neukazuje.
 - Trasa (`DEP > ARR`) sa sťahuje len pre vybrané lietadlo a len raz.
+- Doba držania BtnC pre prepnutie bzučiaka skrátená z 2 s na 0,75 s (750 ms).
 
 ## 3. Ovládanie
 
@@ -233,7 +250,7 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 | **BtnA** (predné) krátko | ďalšia stránka | všetky stránky |
 | **BtnA** dlho (0,6 s) | skok na detail vybraného lietadla (stránka 1) | radar mapa |
 | **BtnC** (vypínacie tlačidlo, bočné) krátko | zmena mierky mapy | radar mapa |
-| **BtnC** držať 2 s | zapnutie/vypnutie bzučiaka (uloží sa) | všetky stránky |
+| **BtnC** držať 0,75 s | zapnutie/vypnutie bzučiaka (uloží sa) | všetky stránky |
 | **BtnB** (bočné) krátko | ďalšie lietadlo | všetky stránky s lietadlom |
 | **BtnB** krátko | ďalšie lietadlo **v rámci aktuálnej mierky** | radar mapa |
 | **BtnB** držať 1 s → 5 s | odpočet, potom reset nastavení | všade (predčasným pustením sa zruší) |
@@ -270,7 +287,8 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 ## 6. Poznámky a obmedzenia
 
 - Skeč musí byť uložený ako `nearPlane/nearPlane.ino` (názov priečinka = názov súboru), inak linker hlási nedefinované `setup`/`loop`.
-- Zariadenie nemá kompas: šípky a mapa sú vždy orientované severom nahor.
+- Zariadenie nemá kompas: šípky a mapa sú vždy orientované severom nahor, aj keď sa mení poloha z GPS.
+- GPS potrebuje fix zo satelitov (približne 25 s vonku); dovtedy, alebo keď modul nie je nájdený, sa používajú súradnice uložené v nastavení.
 - adsb.lol vyžaduje v User-Agent reálny kontakt – zadaj ho vo formulári nastavenia (pole **User-Agent**).
 - Rádius sa zadáva v nautických míľach (1 NM = 1,852 km).
 - Štatistika a hodiny potrebujú funkčné NTP pripojenie.

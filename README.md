@@ -28,10 +28,11 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 - **Emergency alerts** – aircraft with emergency squawk codes (7500, 7600, 7700) are highlighted.
 - **Military and rare aircraft alerts** – a coloured banner, a distinct sound and automatic selection of the aircraft.
 - **Audible alerts** – a tone plays when a new aircraft is detected; alerts have their own sounds.
-- **Buzzer on/off** – hold `BtnC` for 2 seconds to mute or unmute all sounds; the setting is saved.
+- **Buzzer on/off** – hold `BtnC` for 0.75 seconds (750 ms) to mute or unmute all sounds; the setting is saved.
+- **Live GPS position (optional)** – with an M5Stack GPS Unit v1.1 on the Grove port the tracker uses your current position instead of fixed coordinates; the setup form prefills them from the GPS. See [GPS module](#gps-module-optional).
 - **Battery and charging indicator** – battery level with colour coding and a charging icon in the header.
 - **Clock in the header** – synchronised over NTP; configurable UTC offset in the sketch.
-- **Easy web-based configuration** – an access-point setup mode for Wi-Fi, location, scan radius and the User-Agent contact.
+- **Easy web-based configuration** – an access-point setup mode for Wi-Fi, location (prefilled from the GPS when available), scan radius, the User-Agent contact and the GPS switch.
 - **Factory reset** – hold `BtnB` for 5 seconds to clear all settings and return to setup mode.
 - **Automatic deep sleep** – after 5 minutes without aircraft or button activity the device sleeps for 60 seconds and restarts.
 
@@ -42,6 +43,7 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 | Board | M5StickC Plus 2 (M5Stack Arduino core) |
 | Libraries | `M5Unified`, `ArduinoJson` 7.x |
 | Network | 2.4 GHz Wi-Fi with internet access (adsb.lol, adsb.fi, adsb.im, NTP) |
+| GPS (optional) | M5Stack GPS Unit v1.1 (AT6668 + MAX2659) on the Grove port, see [GPS module](#gps-module-optional) |
 | USB | USB-C data cable; CH9102 driver on Windows |
 | API contact | Your own e-mail or URL in the setup form's **User-Agent** field (required by adsb.lol) |
 
@@ -119,13 +121,35 @@ After a successful flash, the device boots into **SETUP MODE** for the first tim
 3. Fill in:
    - **WiFi Network (SSID)** – the name of your local 2.4 GHz network.
    - **WiFi Password** – the password for that network.
-   - **Your Latitude** – e.g. `41.015000`.
-   - **Your Longitude** – e.g. `28.97000`.
+   - **Your Latitude** – e.g. `41.015000`. Prefilled when a GPS module has a fix.
+   - **Your Longitude** – e.g. `28.97000`. Prefilled when a GPS module has a fix.
    - **Scan Radius (NM, max 250)** – the radius around your location, in nautical miles (e.g. `50`; 1 NM = 1.852 km).
    - **User-Agent** – your e-mail or URL; the pre-filled `CHANGE-ME@example.com` is rejected. The value is stored in flash and used for adsb.lol, adsb.fi and route requests.
+   - **Use GPS module if connected** – checkbox, enabled by default; untick it to always use the coordinates above.
 4. Click **Save & Reboot**.
 
 The device saves the settings, restarts, connects to your Wi-Fi and starts tracking. Stats and the clock require a working NTP connection.
+
+If a GPS module is connected, the setup page says whether it has a fix. Without a fix it asks you to reload the page later (values you typed are lost on reload), or you can simply enter the coordinates by hand.
+
+### GPS module (optional)
+
+With an M5Stack GPS Unit v1.1 (AT6668 + MAX2659, NMEA 0183, 115200 baud) plugged into the Grove port, the device uses the **live GPS position** instead of the coordinates saved in setup.
+
+| Aspect | Behaviour |
+|---|---|
+| Wiring | Grove port (G32 / G33). Wire orientation and baud rate (115200 or 9600) are **detected automatically**; no setting is needed |
+| Detection | Runs in the background after boot (about 6 s per round, 5 rounds). A module plugged in later needs a reboot; a module unplugged while running is searched for again |
+| Position used | The GPS position while a fix exists (a fix up to 10 minutes old is kept); otherwise the position saved in setup. The API query, distances, bearings and the radar map follow the current position |
+| Indicator | Top right, below the clock: **GPS** = live fix, **GPS?** = module found, waiting for a fix. Nothing is shown when no module is detected |
+| Setup form | Latitude and longitude are prefilled from the GPS; the checkbox **Use GPS module if connected** turns the feature off |
+| Cold start | The first fix takes about 25 s outdoors (23 s cold start per the datasheet); indoors it may never arrive |
+
+Notes:
+
+- The older GPS Unit (AT6558, 9600 baud) works too. A GPS **Hat** on the 8-pin header uses other pins and is not detected; add its pins to `GPS_PINS` in the sketch.
+- The unit needs 5 V from the Grove port. The sketch enables the external output at boot; if no data arrives on battery power, try USB power.
+- The serial monitor shows `[GPS] module detected ...` and `gps=fix|no-fix|none|off` in the `[LOOP]` lines.
 
 ## Usage
 
@@ -143,8 +167,8 @@ Notes:
 
 - On pages other than the map, `BtnA` acts immediately on press. On the map it acts on release so a long press can be distinguished from a short one.
 - `BtnC` is the third button of the StickC Plus 2 (the power button, exposed as `M5.BtnPWR`).
-- **`BtnC` hold 2 seconds on any page toggles the buzzer.** A "Sound ON/OFF" message appears, and a crossed-out speaker icon is shown next to the battery while muted. The setting survives reboots and is cleared by a settings reset. Alerts remain visible; only the sounds are muted.
-- `BtnC` short press acts on release, so it can be distinguished from the 2-second hold.
+- **`BtnC` hold 0.75 seconds (750 ms) on any page toggles the buzzer.** A "Sound ON/OFF" message appears, and a crossed-out speaker icon is shown next to the battery while muted. The setting survives reboots and is cleared by a settings reset. Alerts remain visible; only the sounds are muted.
+- `BtnC` short press acts on release, so it can be distinguished from the 0.75-second hold.
 - Releasing `BtnB` during the reset countdown cancels the reset.
 
 ### BtnC behaviour
@@ -153,8 +177,8 @@ Notes:
 stateDiagram-v2
     [*] --> Idle
     Idle --> Pressed: BtnC down
-    Pressed --> Idle: release before 2 s → change map scale (map page only)
-    Pressed --> Toggled: held 2 s
+    Pressed --> Idle: release before 0.75 s → change map scale (map page only)
+    Pressed --> Toggled: held 0.75 s
     Toggled --> Idle: release (buzzer toggled, saved)
 ```
 
@@ -241,7 +265,7 @@ flowchart TD
     A([Power on]) --> B{WiFi settings saved?}
     B -- no --> C["Setup mode<br/>AP + web form"] --> D[Save and reboot] --> B
     B -- yes --> E[Connect to Wi-Fi + NTP]
-    E --> F["Poll adsb.lol /v2/point<br/>fallback: adsb.fi"]
+    E --> E2["Position: live GPS fix<br/>or saved coordinates"] --> F["Poll adsb.lol /v2/point<br/>fallback: adsb.fi"]
     F --> G["Stream-parse aircraft<br/>one object at a time"]
     G --> H["Keep 5 closest + 40 map blips<br/>update daily stats"]
     H --> I{Alert?}
@@ -279,6 +303,8 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 | Linker error `undefined reference to setup/loop` | File/folder name mismatch (`nearPlane/nearPlane.ino`) |
 | Reboot loop | Check the serial monitor (115200 baud) for the `Reset reason:` line |
 | No reaction to `BtnC` | The power button is not detected by your board or library version |
+| `GPS?` never turns into `GPS` | No satellite fix yet: move the unit outdoors or near a window and wait a few minutes |
+| No `GPS` indicator at all | Module not detected: check the Grove cable and power, and that **Use GPS module if connected** is enabled in setup |
 
 ## Data sources
 
@@ -288,7 +314,7 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 
 ## Limitations
 
-- No compass: the arrow and map are always north-up.
+- No compass: the arrow and map are always north-up. With the GPS enabled, distances and the map follow your position, but the orientation stays north-up.
 - Stats and the clock need a working NTP connection.
 - `setInsecure()` disables TLS certificate validation (acceptable for public flight data).
 - Built-in type/airline tables cover about 100 types and 80 airlines; extend `TYPE_NAMES` / `AIRLINES` in the sketch.
@@ -311,6 +337,7 @@ The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md
 - Streaming JSON parsing for low memory usage; route fetched once per aircraft.
 - Fixed HTTP 403/426/429 handling, automatic adsb.fi fallback, configurable User-Agent in the setup form, exponential polling backoff and serial diagnostics.
 - Setup radius corrected to nautical miles (max 250) and deep sleep after inactivity.
+- Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, live position and prefilled setup form.
 
 ### Upstream history
 

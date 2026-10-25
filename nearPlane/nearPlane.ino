@@ -1,4 +1,5 @@
 // nearPlane+ - ADS-B tracker for the M5StickC Plus2
+// Optional: GPS module (M5Stack GPS Unit v1.1, AT6668) on the Grove port gives the live position.
 // Features: multiple aircraft (BtnB short press), CPA, alerts (MIL/EMERG/RARE), radar map,
 //           daily statistics (NVS), aircraft type and airline names.
 //
@@ -7,7 +8,7 @@
 //   BtnB short press     = next aircraft
 //   BtnB hold 5 s        = reset settings
 //   BtnC (PWR, side)     = short press: change scale on the radar map page
-//                          hold 2 s: buzzer on/off (saved)
+//                          hold 0.75 s: buzzer on/off (saved)
 
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -40,7 +41,7 @@ DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
 // Default User-Agent, used only when none is saved in the setup form.
-// This is a dummy contact; adsb.lol requires a real e-mail or URL.
+// adsb.lol requires a User-Agent with real contact info (e-mail or URL).
 const char* USER_AGENT = "nearPlane-M5Stick/1.0 (changeme@example.com)";
 String userAgent = USER_AGENT;       // active value (from setup form / NVS key "ua")
 
@@ -221,10 +222,27 @@ String api_url_alt;                  // fallback server (same JSON format)
 unsigned long primaryBlockedUntil = 0;   // primary server rate-limited until this time
 int consecutive429 = 0;
 bool rateLimited = false;            // last request was rate limited (shows a status screen)
+// ---- GPS (optional): M5Stack GPS Unit v1.1 (AT6668 + MAX2659) on the Grove port
+HardwareSerial GPSSerial(1);
+bool gpsEnabled = true;              // setting "Use GPS module if connected" (NVS key "gps")
+bool gpsDetected = false;            // valid NMEA sentences are arriving
+bool gpsEverFix = false;             // at least one valid position received
+bool gpsGaveUp = false;              // no module found after several detection rounds
+double gpsLat = 0, gpsLon = 0;
+int gpsSats = 0;
+unsigned long gpsLastFixMs = 0, gpsLastSeenMs = 0, gpsComboStart = 0;
+int gpsCombo = 0, gpsCombosTried = 0;
+char nmeaBuf[128];
+int nmeaLen = 0;
+double cfgLat = 0, cfgLon = 0;       // position saved in the setup form
+bool posFromGps = false;             // current home position comes from the GPS
+unsigned long lastHomeUpdate = 0;
+const int GPS_PINS[2][2] = {{33, 32}, {32, 33}};   // {RX, TX}: both Grove wire orientations
+const long GPS_BAUDS[2] = {115200, 9600};          // v1.1 (AT6668) = 115200, v1 (AT6558) = 9600
 bool soundOn = true;                 // buzzer enabled (persisted in NVS)
 bool btnCDown = false, btnCToggled = false;
 unsigned long btnCStart = 0;
-const unsigned long BTN_C_HOLD_MS = 2000;   // hold BtnC this long to toggle the buzzer
+const unsigned long BTN_C_HOLD_MS = 750;   // hold BtnC this long to toggle the buzzer
 unsigned long toastUntil = 0;        // on-screen message visible until this time
 int mapScaleIdx = 0;                 // 0 = full configured radius, 1..3 = 25 / 12.5 / 7.5 km
 bool btnADown = false, btnALong = false;
@@ -300,7 +318,7 @@ const char* RARE_TYPES[] = {
 #define KV_COUNT(x) (sizeof(x) / sizeof(x[0]))
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="50" min="1" max="250" required><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="nearPlane-M5Stick/1.0 (CHANGE-ME@example.com)" maxlength="120" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><button type="submit">Save & Reboot</button></form></div><div class="footer">nearPlane+ - M5StickC Plus 2 Edition</div></body></html>
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="50" min="1" max="250" required><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="nearPlane-M5Stick/1.0 (CHANGE-ME@example.com)" maxlength="120" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><button type="submit">Save & Reboot</button></form></div><div class="footer">nearPlane+ - M5StickC Plus 2 Edition</div></body></html>
 )rawliteral";
 
 // ---------------------------------------------------------------- prototypes
@@ -321,6 +339,10 @@ void goToSleep();
 void drawClock();
 void saveStats();
 void showToast(const char* text);
+bool gpsFixLive();
+void gpsPoll();
+void updateHomePosition();
+void buildUrls();
 bool toastActive();
 
 // ---------------------------------------------------------------- helper functions
@@ -433,6 +455,132 @@ bool computeCpa(const Aircraft& a, const Rel& r, double& cpaNm, double& tSec) {
   cpaNm = sqrt(ex * ex + ey * ey);
   tSec = t;
   return true;
+}
+
+// ---------------------------------------------------------------- GPS (optional)
+// NMEA 0183 from the GPS unit. Wire orientation and baud rate are detected automatically.
+void gpsStartCombo(int idx) {
+  int pins = idx % 2, baud = (idx / 2) % 2;
+  GPSSerial.end();
+  GPSSerial.setRxBufferSize(1024);
+  GPSSerial.begin(GPS_BAUDS[baud], SERIAL_8N1, GPS_PINS[pins][0], GPS_PINS[pins][1]);
+  gpsCombo = idx;
+  gpsComboStart = millis();
+  nmeaLen = 0;
+}
+
+void gpsBegin() {
+  gpsCombosTried = 0;
+  gpsGaveUp = false;
+  gpsStartCombo(0);
+}
+
+// "ddmm.mmmm" + hemisphere -> signed degrees
+bool nmeaToDeg(const char* s, const char* hemi, double& out) {
+  if (!s || !*s || !hemi || !*hemi) return false;
+  double v = atof(s);
+  int deg = (int)(v / 100.0);
+  double d = deg + (v - deg * 100.0) / 60.0;
+  if (hemi[0] == 'S' || hemi[0] == 'W') d = -d;
+  out = d;
+  return true;
+}
+
+void gpsSetFix(double lat, double lon) {
+  gpsLat = lat;
+  gpsLon = lon;
+  gpsEverFix = true;
+  gpsLastFixMs = millis();
+}
+
+void gpsHandleLine(char* line) {
+  char* star = strchr(line, '*');
+  if (!star) return;
+  uint8_t cs = 0;
+  for (char* q = line + 1; q < star; q++) cs ^= (uint8_t)*q;
+  if ((uint8_t)strtoul(star + 1, nullptr, 16) != cs) return;   // bad checksum (wrong baud, noise)
+  *star = 0;
+
+  if (!gpsDetected) {
+    Serial.printf("[GPS] module detected (combo %d: RX=%d TX=%d, %ld baud)\n", gpsCombo,
+                  GPS_PINS[gpsCombo % 2][0], GPS_PINS[gpsCombo % 2][1], GPS_BAUDS[(gpsCombo / 2) % 2]);
+  }
+  gpsDetected = true;
+  gpsLastSeenMs = millis();
+
+  char* f[16];
+  int n = 0;
+  f[n++] = line;
+  for (char* q = line; *q && n < 16; q++) {
+    if (*q == ',') { *q = 0; f[n++] = q + 1; }
+  }
+  if (strlen(f[0]) < 6) return;
+  const char* type = f[0] + 3;       // "$GNGGA" -> "GGA"
+  double lat, lon;
+  if (strncmp(type, "GGA", 3) == 0 && n >= 8) {          // time,lat,N/S,lon,E/W,quality,sats
+    gpsSats = atoi(f[7]);
+    if (atoi(f[6]) > 0 && nmeaToDeg(f[2], f[3], lat) && nmeaToDeg(f[4], f[5], lon)) gpsSetFix(lat, lon);
+  } else if (strncmp(type, "RMC", 3) == 0 && n >= 7) {   // time,status,lat,N/S,lon,E/W
+    if (f[2][0] == 'A' && nmeaToDeg(f[3], f[4], lat) && nmeaToDeg(f[5], f[6], lon)) gpsSetFix(lat, lon);
+  }
+}
+
+void gpsFeed(int c) {
+  if (c == '$') { nmeaLen = 0; nmeaBuf[nmeaLen++] = '$'; return; }
+  if (nmeaLen == 0) return;
+  if (c == '\r' || c == '\n') {
+    nmeaBuf[nmeaLen] = 0;
+    nmeaLen = 0;
+    gpsHandleLine(nmeaBuf);
+    return;
+  }
+  if (nmeaLen < (int)sizeof(nmeaBuf) - 1) nmeaBuf[nmeaLen++] = (char)c;
+  else nmeaLen = 0;
+}
+
+void gpsPoll() {
+  if (!gpsEnabled) return;
+  while (GPSSerial.available() > 0) gpsFeed(GPSSerial.read());
+
+  if (gpsDetected && millis() - gpsLastSeenMs > 10000) {   // module unplugged: search again
+    gpsDetected = false;
+    gpsGaveUp = false;
+    gpsCombosTried = 0;
+    gpsComboStart = millis();
+    Serial.println("[GPS] no data for 10 s, searching again");
+  }
+  if (!gpsDetected && !gpsGaveUp && millis() - gpsComboStart > 1600) {
+    gpsCombosTried++;
+    if (gpsCombosTried >= 20) {          // 5 rounds over all pin/baud combinations
+      gpsGaveUp = true;
+      GPSSerial.end();
+      Serial.println("[GPS] no module found (reboot to search again)");
+    } else {
+      gpsStartCombo((gpsCombo + 1) % 4);
+    }
+  }
+}
+
+// position updated within the last 5 s
+bool gpsFixLive() {
+  return gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 5000;
+}
+
+// Home position = GPS position (while a fix is available, up to 10 min old), else the saved one
+void updateHomePosition() {
+  bool useGps = gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 600000UL;
+  if (useGps) { homeLat = gpsLat; homeLon = gpsLon; }
+  else { homeLat = cfgLat; homeLon = cfgLon; }
+  posFromGps = useGps;
+}
+
+void buildUrls() {
+  String la = String(homeLat, 5), lo = String(homeLon, 5);
+  // /v2/point returns all aircraft in range, we pick the nearest ourselves
+  api_url = "https://api.adsb.lol/v2/point/" + la + "/" + lo + "/" + radius_km;
+  // Fallback used while adsb.lol answers 429: adsb.fi open data (ADSBexchange v2 compatible,
+  // free for personal non-commercial use, 1 request/s; please credit adsb.fi)
+  api_url_alt = "https://opendata.adsb.fi/api/v2/lat/" + la + "/lon/" + lo + "/dist/" + radius_km;
 }
 
 // ---------------------------------------------------------------- statistics
@@ -786,6 +934,9 @@ void setup() {
   M5.Power.begin();
   preferences.begin("adsb-config", false);
   soundOn = preferences.getBool("sound", true);
+  gpsEnabled = preferences.getBool("gps", true);
+  M5.Power.setExtOutput(gpsEnabled);    // 5V on the Grove port only when GPS is enabled
+  if (gpsEnabled) gpsBegin();
   M5.Speaker.setVolume(255);
   if (soundOn) M5.Speaker.tone(2000, 100);
   M5.Display.setRotation(1);
@@ -806,6 +957,11 @@ void setup() {
 void loop() {
   M5.update();
   handleButtons();
+  gpsPoll();
+  if (millis() - lastHomeUpdate > 1000) {
+    lastHomeUpdate = millis();
+    updateHomePosition();
+  }
   if (isResetting) { return; }
   if (configMode) {
     dnsServer.processNextRequest();
@@ -815,9 +971,10 @@ void loop() {
       lastBeat = millis();
       long left = (long)pollInterval - (long)(millis() - lastPollTime);
       if (firstPoll) left = 0;
-      Serial.printf("[LOOP] wifi=%d, next poll in %ld s, aircraft=%d, heap=%u\n",
+      const char* gs = !gpsEnabled ? "off" : gpsFixLive() ? "fix" : gpsDetected ? "no-fix" : "none";
+      Serial.printf("[LOOP] wifi=%d, next poll in %ld s, aircraft=%d, heap=%u, gps=%s, pos=%.5f,%.5f%s\n",
                     (int)WiFi.status(), left > 0 ? left / 1000 : 0L, acCount,
-                    (unsigned int)ESP.getFreeHeap());
+                    (unsigned int)ESP.getFreeHeap(), gs, homeLat, homeLon, posFromGps ? " (GPS)" : "");
     }
     if (WiFi.status() == WL_CONNECTED && (firstPoll || millis() - lastPollTime > pollInterval)) {
       firstPoll = false;
@@ -906,6 +1063,13 @@ void drawBatteryStatus() {
     canvas.drawLine(x + 9, y + 2, x + 14, y + 8, TFT_RED);
     canvas.drawLine(x + 9, y + 8, x + 14, y + 2, TFT_RED);
   }
+
+  if (gpsEnabled && gpsDetected) {   // GPS = live fix, GPS? = module found, no fix yet
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(uiFg);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(gpsFixLive() ? "GPS" : "GPS?", 235, 15);
+  }
 }
 
 void drawClock() {
@@ -986,7 +1150,7 @@ void handleButtons() {
       btnAStart = millis();
     }
   }
-  // BtnC: short press = radar map scale, hold 2 s = buzzer on/off
+  // BtnC: short press = radar map scale, hold 0.75 s = buzzer on/off
   if (!isResetting && M5.BtnPWR.wasPressed()) {
     btnCDown = true;
     btnCToggled = false;
@@ -1106,18 +1270,15 @@ void loadSettingsAndConnect() {
   latitude = preferences.getString("lat", "0.0");
   longitude = preferences.getString("lon", "0.0");
   radius_km = preferences.getString("radius", "50");   // value is in NM (nautical miles)
-  homeLat = latitude.toDouble();
-  homeLon = longitude.toDouble();
+  cfgLat = latitude.toDouble();
+  cfgLon = longitude.toDouble();
+  updateHomePosition();
   radiusNm = radius_km.toFloat();
   if (radiusNm < 1) radiusNm = 50;
   userAgent = preferences.getString("ua", "");
   userAgent.trim();
   if (userAgent.length() < 8) userAgent = USER_AGENT;   // nothing saved: use the built-in default
-  // /v2/point returns all aircraft in range, we pick the nearest ourselves
-  api_url = "https://api.adsb.lol/v2/point/" + latitude + "/" + longitude + "/" + radius_km;
-  // Fallback used while adsb.lol answers 429: adsb.fi open data (ADSBexchange v2 compatible,
-  // free for personal non-commercial use, 1 request/s; please credit adsb.fi)
-  api_url_alt = "https://opendata.adsb.fi/api/v2/lat/" + latitude + "/lon/" + longitude + "/dist/" + radius_km;
+  buildUrls();
   canvas.fillScreen(BLACK);
   canvas.setTextColor(TFT_WHITE);
   canvas.setFont(&fonts::FreeSans9pt7b);
@@ -1158,7 +1319,27 @@ void loadSettingsAndConnect() {
   }
 }
 
-void handleRoot() { server.send_P(200, "text/html", index_html); }
+void handleRoot() {
+  String html = FPSTR(index_html);
+  String lat = "", lon = "", msg;
+  bool gpsPosUsable = gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 600000UL;
+  if (gpsPosUsable) {
+    lat = String(gpsLat, 6);
+    lon = String(gpsLon, 6);
+    msg = "GPS fix found, coordinates prefilled (" + String(gpsSats) + " satellites).";
+  } else if (!gpsEnabled) {
+    msg = "GPS is disabled.";
+  } else if (gpsDetected) {
+    msg = "GPS module found, waiting for a satellite fix. Reload this page in a moment (typed values are lost).";
+  } else {
+    msg = "No GPS module detected (optional).";
+  }
+  html.replace("%GPSMSG%", msg);
+  html.replace("%LAT%", lat);
+  html.replace("%LON%", lon);
+  html.replace("%GPSCHK%", gpsEnabled ? "checked" : "");
+  server.send(200, "text/html", html);
+}
 
 void handleSave() {
   // User-Agent: single line only (no CR/LF header injection), must be a real contact
@@ -1175,6 +1356,7 @@ void handleSave() {
     return;
   }
   preferences.putString("ua", ua);
+  preferences.putBool("gps", server.hasArg("gps"));
   preferences.putString("ssid", server.arg("ssid"));
   preferences.putString("password", server.arg("password"));
   preferences.putString("lat", server.arg("lat"));
@@ -1644,6 +1826,10 @@ void fetchAircraftData() {
 
   Serial.println();
   Serial.println("========== AIRCRAFT API ==========");
+  updateHomePosition();
+  buildUrls();
+  Serial.printf("[AIRCRAFT] position %.5f, %.5f (%s)\n", homeLat, homeLon,
+                posFromGps ? "GPS" : "saved in setup");
 
   if (acCount == 0 && !rateLimited) {
     canvas.fillScreen(TFT_BLACK);
