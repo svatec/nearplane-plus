@@ -1,6 +1,6 @@
 # nearPlane+ – Changelog & Controls / Zmeny a ovládanie
 
-nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino`
+nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.1)
 
 **Language / Jazyk:** [English](#english) · [Slovenčina](#slovenčina)
 
@@ -149,6 +149,35 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - Stats and the clock need a working NTP connection.
 - `setInsecure()` disables TLS certificate validation; acceptable for public flight data, not for sensitive traffic.
 
+## 7. v4.1 – reliability and build
+
+### 7.1 Fixes
+
+| # | Problem | Cause | Fix |
+|---|---|---|---|
+| 1 | Setup access point ran forever and drained the battery | `configMode` branch in `loop()` never checked the inactivity timeout | Setup AP switches off after 10 minutes of inactivity (paused while charging) and the device goes to deep sleep |
+| 2 | After a Wi-Fi outage the device never reconnected | `WiFi.begin()` was called only once during boot | `ensureWifi()` reconnects with a 5–60 s backoff; after 10 minutes without a connection it reopens the setup AP |
+| 3 | The display froze for up to 10 s after `BtnB` | Route lookup ran synchronously inside the button handler | Route lookup moved to a background task; the UI and buttons keep running |
+| 4 | A single route timeout left `- > -` permanently | `routeTried` was set before the request | Failed lookups are retried after 60 s, at most 3 times per aircraft |
+| 5 | Entering setup mode again lost the stored values | The form was not prefilled | SSID, radius and User-Agent are prefilled from NVS (password is never prefilled) |
+| 6 | Invalid values could be stored (`lat=abc`, radius 9999) | No server-side validation | Strict parsing and range checks with an error page |
+| 7 | Clock wrong twice a year | Fixed UTC offset in the sketch | `configTzTime()` with `TZ_INFO` (`CET-1CEST,M3.5.0,M10.5.0/3`), daylight saving automatic |
+| 8 | Firmware version was not visible anywhere | Only a hardcoded serial string | `FW_VERSION` shown in the footer, the setup page and the serial banner |
+
+### 7.2 Build
+
+- `platformio.ini` – reproducible build with pinned `M5Unified` and `ArduinoJson` versions, 8 MB partition table for the Plus 2.
+- GitHub Actions workflow compiles the firmware on every push and pull request.
+- Build artifacts (`nearPlane/build/`) and `.DS_Store` removed from git and ignored.
+
+### 7.3 Behaviour changes
+
+- The setup access point switches off after 10 minutes of inactivity (paused while charging).
+- Wi-Fi is reconnected automatically; after 10 minutes without a connection the device returns to setup mode.
+- The route lookup runs in a background task, so the display and buttons stay responsive; failed lookups are retried (60 s, max 3 attempts).
+- The setup form is prefilled from the stored settings and validated on the device.
+- The footer shows the firmware version; the clock handles daylight saving automatically.
+
 ---
 
 <a id="slovenčina"></a>
@@ -293,3 +322,32 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 - Rádius sa zadáva v nautických míľach (1 NM = 1,852 km).
 - Štatistika a hodiny potrebujú funkčné NTP pripojenie.
 - `setInsecure()` vypína overovanie TLS certifikátu; pre verejné letové dáta je to prijateľné, pre citlivú komunikáciu nie.
+
+## 7. v4.1 – robustnosť a build
+
+### 7.1 Opravy
+
+| # | Problém | Príčina | Oprava |
+|---|---|---|---|
+| 1 | Setup AP bežal donekonečna a vybíjal batériu | Vetva `configMode` v `loop()` nekontrolovala timeout neaktivity | Setup AP sa po 10 min neaktivity vypne (pri nabíjaní nie) a zariadenie ide do deep sleep |
+| 2 | Po výpadku Wi-Fi sa zariadenie už nepripojilo | `WiFi.begin()` sa volal len raz pri boote | `ensureWifi()` reconnectuje s backoffom 5–60 s; po 10 min bez spojenia znovu otvorí setup AP |
+| 3 | Displej zamrzol až na 10 s po `BtnB` | Route lookup bežal synchrónne v handleri tlačidla | Route lookup presunutý do background tasku; UI a tlačidlá idú ďalej |
+| 4 | Jeden timeout trasy nechal `- > -` navždy | `routeTried` sa nastavil pred requestom | Neúspešný lookup sa opakuje po 60 s, max. 3× pre lietadlo |
+| 5 | Opätovný vstup do setupu stratil uložené hodnoty | Formulár sa nepredvypĺňal | SSID, radius a User-Agent sa predvypĺňajú z NVS (heslo sa nepredvypĺňa) |
+| 6 | Do NVS sa dali uložiť nezmysly (`lat=abc`, radius 9999) | Chýbala server-side validácia | Striktné parsovanie a kontroly rozsahov s chybovou stránkou |
+| 7 | Hodiny boli 2× ročne zle | Pevný UTC offset v skeči | `configTzTime()` s `TZ_INFO` (`CET-1CEST,M3.5.0,M10.5.0/3`), letný čas automaticky |
+| 8 | Verzia firmvéru nebola nikde vidieť | Len natvrdo v serial output | `FW_VERSION` v pätičke, v setup stránke a v serial banneri |
+
+### 7.2 Build
+
+- `platformio.ini` – reprodukovateľný build s pinovanými verziami `M5Unified` a `ArduinoJson`, 8 MB partition table pre Plus 2.
+- GitHub Actions workflow kompiluje firmware pri každom pushi a pull requeste.
+- Build artefakty (`nearPlane/build/`) a `.DS_Store` odstránené z gitu a ignorované.
+
+### 7.3 Zmeny správania
+
+- Setup access point sa po 10 min neaktivity vypne (pri nabíjaní nie).
+- Wi-Fi sa obnovuje automaticky; po 10 min bez spojenia sa zariadenie vráti do setup módu.
+- Route lookup beží v background tasku, takže displej a tlačidlá reagujú; neúspešné pokusy sa opakujú (60 s, max. 3×).
+- Setup formulár sa predvypĺňa z uložených hodnôt a validuje priamo v zariadení.
+- Pätička zobrazuje verziu firmvéru; hodiny zvládajú letný/zimný čas automaticky.

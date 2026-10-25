@@ -24,4 +24,11 @@ First off, thank you for considering contributing! Your help is appreciated.
 6.  Push to the branch (`git push origin feature/your-feature-name`).
 7.  Create a new Pull Request.
 
+### Before you open a pull request
+
+1. Build the firmware: `pio run` (or Arduino IDE) must pass – CI runs the same build.
+2. Keep library versions pinned in `platformio.ini`.
+3. Update both `README.md` and `nearPlane/CHANGELOG.md` (English and Slovak sections).
+4. Do not commit build artifacts (`nearPlane/build/`, `.pio/`) or `.DS_Store`.
+
 Thanks again for your contribution!

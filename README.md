@@ -2,6 +2,9 @@
 
 ![nearPlane+ screen tour](m5_screens.gif)
 
+[![firmware](https://github.com/svatec/nearplane-plus/actions/workflows/build.yml/badge.svg)](https://github.com/svatec/nearplane-plus/actions/workflows/build.yml)
+<br>**Firmware v4.1** · build checked on every push
+
 **nearPlane+** turns an `M5StickC Plus 2` that is dying in your stuff drawer (I know you have one, everybody does, no worries) into a portable, real-time aircraft tracker. No need to check Flightradar or anything else. It is perfect for aviation enthusiasts, curious minds, and anyone who has ever looked up at the sky and wondered, "What plane is that?"
 
 This repository is a fork of [nearPlane](https://github.com/stevenselcuk/nearPlane) by **Steven J. Selcuk**. The original idea, base firmware and installation workflow come from him. This fork keeps that foundation and extends it with more pages, multiple aircraft, a radar map, alerts, daily statistics and several reliability fixes. See [Credits](#credits).
@@ -31,10 +34,11 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 - **Buzzer on/off** – hold `BtnC` for 0.75 seconds (750 ms) to mute or unmute all sounds; the setting is saved.
 - **Live GPS position (optional)** – with an M5Stack GPS Unit v1.1 on the Grove port the tracker uses your current position instead of fixed coordinates; the setup form prefills them from the GPS. See [GPS module](#gps-module-optional).
 - **Battery and charging indicator** – battery level with colour coding and a charging icon in the header.
-- **Clock in the header** – synchronised over NTP; configurable UTC offset in the sketch.
+- **Clock in the header** – synchronised over NTP with automatic CET/CEST daylight saving (change `TZ_INFO` in the sketch for another zone).
 - **Easy web-based configuration** – an access-point setup mode for Wi-Fi, location (prefilled from the GPS when available), scan radius, the User-Agent contact and the GPS switch.
 - **Factory reset** – hold `BtnB` for 5 seconds to clear all settings and return to setup mode.
 - **Automatic deep sleep** – after 5 minutes without aircraft or button activity the device sleeps for 60 seconds and restarts.
+- **Self-healing connection** – lost Wi-Fi is reconnected automatically (backoff 5–60 s); after 10 minutes without a connection the device returns to setup mode. The setup access point switches itself off after 10 minutes of inactivity (unless charging), so it cannot drain the battery.
 
 ## Requirements
 
@@ -106,11 +110,23 @@ The M5StickC Plus 2 uses a CH9102 chip for USB communication. Install the driver
 1. Clone this repository or download the source code.
 2. Open `nearPlane/nearPlane.ino` in the Arduino IDE.
 3. No code edit is needed for the User-Agent: you will set your own contact in the setup form (see [Before first use](#before-first-use)).
-4. Optionally set `gmtOffset_sec` to your UTC offset so the clock shows local time.
+4. Optionally change `TZ_INFO` if you are outside the CET/CEST zone (default `"CET-1CEST,M3.5.0,M10.5.0/3"`); daylight saving is handled automatically.
 5. Connect the M5StickC Plus 2 to your computer with the USB-C cable.
 6. Go to **Tools > Board** and from the "M5Stack Arduino" section select **M5StickCPlus2**.
 7. Go to **Tools > Port** and select the serial port of your device (e.g. `COM3` on Windows, `/dev/cu.wchusbserial...` on macOS).
 8. Click **Upload** (the arrow icon) to compile and flash the firmware.
+
+### Build with PlatformIO (optional)
+
+The Arduino IDE workflow above stays the recommended path. For a reproducible build with pinned library versions there is a `platformio.ini` in the repository root:
+
+```bash
+pio run                # build
+pio run -t upload      # flash over USB
+pio device monitor     # serial monitor, 115200 baud
+```
+
+The project is configured for the 8 MB flash of the Plus 2 (`default_8MB.csv` partition table); with the 4 MB default table the firmware does not fit. GitHub Actions runs the same build on every push and pull request (`.github/workflows/build.yml`).
 
 ### Device configuration
 
@@ -119,16 +135,20 @@ After a successful flash, the device boots into **SETUP MODE** for the first tim
 1. On your phone or computer, connect to the Wi-Fi network **`nearPlane-ADSB-Tracker-Setup`**.
 2. Open `http://192.168.4.1` in a browser.
 3. Fill in:
-   - **WiFi Network (SSID)** – the name of your local 2.4 GHz network.
-   - **WiFi Password** – the password for that network.
+   - **WiFi Network (SSID)** – the name of your local 2.4 GHz network. Prefilled when settings already exist.
+   - **WiFi Password** – the password for that network (never prefilled).
    - **Your Latitude** – e.g. `41.015000`. Prefilled when a GPS module has a fix.
    - **Your Longitude** – e.g. `28.97000`. Prefilled when a GPS module has a fix.
-   - **Scan Radius (NM, max 250)** – the radius around your location, in nautical miles (e.g. `50`; 1 NM = 1.852 km).
-   - **User-Agent** – your e-mail or URL; the pre-filled `CHANGE-ME@example.com` is rejected. The value is stored in flash and used for adsb.lol, adsb.fi and route requests.
+   - **Scan Radius (NM, max 250)** – the radius around your location, in nautical miles (e.g. `50`; 1 NM = 1.852 km). Prefilled with the stored value.
+   - **User-Agent** – your e-mail or URL; the value is stored in flash and used for adsb.lol, adsb.fi and route requests. Prefilled when already set.
    - **Use GPS module if connected** – checkbox, enabled by default; untick it to always use the coordinates above.
 4. Click **Save & Reboot**.
 
+Values are validated on the device: the SSID must have 1–32 characters, latitude must be between -90 and 90, longitude between -180 and 180 and the radius a whole number from 1 to 250. A rejected value shows an error page instead of silently storing garbage.
+
 The device saves the settings, restarts, connects to your Wi-Fi and starts tracking. Stats and the clock require a working NTP connection.
+
+The setup access point switches itself off after 10 minutes of inactivity (it stays on while charging). The form is prefilled from flash, so reconfiguring does not require retyping the SSID, radius or User-Agent.
 
 If a GPS module is connected, the setup page says whether it has a fix. Without a fix it asks you to reload the page later (values you typed are lost on reload), or you can simply enter the coordinates by hand.
 
@@ -272,7 +292,7 @@ flowchart TD
     I -- yes --> J[Select aircraft, sound, page 1]
     I -- no --> K[Render current page]
     J --> K
-    K --> L["Fetch route for selected aircraft<br/>adsb.im, once per aircraft"]
+    K --> L["Route lookup in background task<br/>adsb.im, max 3 attempts"]
     L --> M["Redraw every second<br/>dead reckoning between polls"]
     M --> F
     M --> N{"5 min without<br/>aircraft or buttons?"}
@@ -288,6 +308,7 @@ flowchart TD
 | Other error (parse, 5xx, timeout) | 60 s |
 | HTTP 429 (rate limit) | 20 s, doubling up to 120 s (the `Retry-After` header wins); the fallback server is tried immediately; last data stays on screen |
 | Redraw of pages 7–9 (local calculation, no API call) | 1 s |
+| Route lookup (adsb.im, background task) | once per selected aircraft; a failed lookup is retried after 60 s, max 3 attempts |
 
 If adsb.lol answers 429, the sketch immediately retries the same request on `opendata.adsb.fi` and keeps using it until the primary block expires.
 
@@ -305,6 +326,23 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 | No reaction to `BtnC` | The power button is not detected by your board or library version |
 | `GPS?` never turns into `GPS` | No satellite fix yet: move the unit outdoors or near a window and wait a few minutes |
 | No `GPS` indicator at all | Module not detected: check the Grove cable and power, and that **Use GPS module if connected** is enabled in setup |
+| Wi-Fi dropped and never came back | Fixed in v4.1: the device reconnects with a 5–60 s backoff; after 10 minutes without a connection it opens the setup AP again |
+| Setup Wi-Fi disappeared while configuring | Setup-mode idle timeout (10 minutes, paused while charging). Power-cycle the device to reopen it, or hold `BtnB` 5 s for a settings reset |
+| Clock off by one hour | `TZ_INFO` does not match your timezone; the default is CET/CEST with automatic daylight saving |
+| Route stays `- > -` | The route lookup failed 3 times for that aircraft; select another aircraft or wait for the next poll |
+
+### Diagnostics (serial)
+
+The serial monitor (115200 baud) prints one prefixed line per subsystem:
+
+| Prefix | Meaning |
+|---|---|
+| `[LOOP]` | heartbeat every 5 s: Wi-Fi state, next poll, aircraft count, free heap, GPS state, home position |
+| `[WIFI]` | connection lost / reconnect attempt with backoff / reconnected / fallback to setup mode |
+| `[SETUP]` | setup access point idle timeout |
+| `[ROUTE]` | background route lookup result and HTTP code |
+| `[AIRCRAFT]` | API poll, HTTP status, scan counters, heap before/after TLS |
+| `[GPS]` | module detection, pin/baud combination, fix state |
 
 ## Data sources
 
@@ -319,6 +357,7 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 - `setInsecure()` disables TLS certificate validation (acceptable for public flight data).
 - Built-in type/airline tables cover about 100 types and 80 airlines; extend `TYPE_NAMES` / `AIRLINES` in the sketch.
 - The scan radius is entered in nautical miles (max 250), not kilometres.
+- The setup access point is open (no password) and serves plain HTTP; configure the device at home, not in a public place.
 
 ## Changelog
 
@@ -338,6 +377,8 @@ The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md
 - Fixed HTTP 403/426/429 handling, automatic adsb.fi fallback, configurable User-Agent in the setup form, exponential polling backoff and serial diagnostics.
 - Setup radius corrected to nautical miles (max 250) and deep sleep after inactivity.
 - Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, live position and prefilled setup form.
+- **v4.1 – robustness:** Wi-Fi auto-reconnect with backoff and fallback to the setup AP, setup-mode idle timeout, route lookup moved to a background task (UI and buttons no longer freeze) with up to 3 retries, server-side validation of the setup form, prefilled setup fields, automatic daylight saving via `TZ_INFO`, firmware version in the footer and setup page.
+- **v4.1 – build:** `platformio.ini` with pinned library versions, GitHub Actions compile check, build artifacts and `.DS_Store` removed from git.
 
 ### Upstream history
 

@@ -40,6 +40,9 @@ WebServer server(80);
 DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
+// Firmware version, shown in the footer, in the setup page and in the serial banner
+const char* FW_VERSION = "v4.1";
+
 // Default User-Agent, used only when none is saved in the setup form.
 // adsb.lol requires a User-Agent with real contact info (e-mail or URL).
 const char* USER_AGENT = "nearPlane-M5Stick/1.0 (changeme@example.com)";
@@ -62,6 +65,14 @@ unsigned long pollInterval = SHORT_POLL_INTERVAL;
 const long RESET_HOLD_TIME_MS = 5000;
 const long BTN_B_HOLD_MS = 1000;   // from this press length the reset countdown is shown
 
+// ---------------------------------------------------------------- self-healing
+const unsigned long CONFIG_MODE_TIMEOUT_MS = 600000UL;    // setup AP idle timeout: 10 min
+const unsigned long WIFI_FALLBACK_TIMEOUT_MS = 600000UL;  // no Wi-Fi for 10 min: back to setup AP
+const unsigned long WIFI_BACKOFF_MIN = 5000UL;            // reconnect backoff: 5, 10, 20, 40, 60...
+const unsigned long WIFI_BACKOFF_MAX = 60000UL;
+const int ROUTE_MAX_TRIES = 3;                            // failed route lookups are retried
+const unsigned long ROUTE_RETRY_DELAY_MS = 60000UL;       // ...after 60 s
+
 // ---------------------------------------------------------------- configuration
 bool configMode = false;
 String wifi_ssid, wifi_password, latitude, longitude, radius_km;
@@ -81,14 +92,16 @@ const unsigned long INACTIVITY_TIMEOUT_MS = 300000;
 const uint64_t DEEP_SLEEP_DURATION_S = 60;
 
 const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 3 * 3600;
-const int daylightOffset_sec = 0;
+// POSIX TZ string pre Europe/Bratislava (CET/CEST) – letny cas sa prepina automaticky.
+// Pri inej zone zmen len tento string, napr. "UTC0" alebo "GMT0BST,M3.5.0/1,M10.5.0".
+const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // ---------------------------------------------------------------- data types
 struct Aircraft {
   char flight[9], reg[12], type[6], hex[8], squawk[6], emergency[14], category[4];
   char navModes[24], desc[26], dep[5], arr[5];
   bool routeTried, onGround, hasPos, hasTrack, hasHdg;
+  uint8_t routeTries;     // failed route lookups (retried up to ROUTE_MAX_TRIES)
   uint8_t level;          // 0 = none, 1 = rare type, 2 = military, 3 = emergency
   uint16_t dbFlags;
   uint32_t hex32;
@@ -210,7 +223,32 @@ uint32_t lastNearestHex = 0;
 uint32_t alertedHex[8] = {0};
 int alertedIdx = 0;
 unsigned long lastRedraw = 0;
-bool routePending = false;          // route is fetched in loop(), outside the first TLS connection
+
+// ---------------------------------------------------------------- route lookup (background task)
+// Trasa sa stahuje mimo hlavnej slucky, aby displej ani tlacidla nezamrzli.
+struct RouteReq { uint32_t hex; char flight[9]; };
+struct RouteResult { uint32_t hex; char dep[5]; char arr[5]; bool ok; };
+RouteReq routeReq;
+RouteResult routeResult;
+volatile bool routeReqPending = false;
+volatile bool routeBusy = false;
+volatile bool routeResultReady = false;
+bool routeTaskOk = false;                // background task started successfully
+unsigned long routeRetryAt = 0;          // earliest time for the next attempt
+portMUX_TYPE routeMux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t netMutex = nullptr;    // one TLS request at a time (poll vs. route task)
+
+// Drzi mutex po celu dobu TLS requestu a uvolni ho pri kazdom navrate.
+struct NetLock {
+  NetLock() { if (netMutex) xSemaphoreTake(netMutex, portMAX_DELAY); }
+  ~NetLock() { if (netMutex) xSemaphoreGive(netMutex); }
+};
+
+// ---------------------------------------------------------------- Wi-Fi watchdog
+unsigned long wifiRetryAt = 0;
+unsigned long wifiBackoff = 0;
+unsigned long wifiDownSince = 0;
+
 bool firstPoll = true;               // first fetch right after connecting
 unsigned long lastBeat = 0;
 int scanObjs = 0, scanParsed = 0, scanNoPos = 0;
@@ -318,7 +356,7 @@ const char* RARE_TYPES[] = {
 #define KV_COUNT(x) (sizeof(x) / sizeof(x[0]))
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="50" min="1" max="250" required><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="nearPlane-M5Stick/1.0 (CHANGE-ME@example.com)" maxlength="120" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><button type="submit">Save & Reboot</button></form></div><div class="footer">nearPlane+ - M5StickC Plus 2 Edition</div></body></html>
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="32" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="%RADIUS%" min="1" max="250" required><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="%UA%" maxlength="120" placeholder="nearPlane-M5Stick/1.0 (you@example.com)" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><button type="submit">Save & Reboot</button></form></div><div class="footer">nearPlane+ %VER% - M5StickC Plus 2 Edition</div></body></html>
 )rawliteral";
 
 // ---------------------------------------------------------------- prototypes
@@ -329,7 +367,6 @@ void displayCurrentPage();
 void startConfigMode();
 void loadSettingsAndConnect();
 void fetchAircraftData();
-bool ensureRoute(int idx);
 void playNewAircraftSound();
 void handleButtons();
 void drawResetScreen(int seconds_left);
@@ -344,6 +381,9 @@ void gpsPoll();
 void updateHomePosition();
 void buildUrls();
 bool toastActive();
+void ensureWifi();
+void requestRoute(int idx);
+void applyRouteResult();
 
 // ---------------------------------------------------------------- helper functions
 static void cpy(char* dst, size_t n, const char* src) {
@@ -863,16 +903,12 @@ bool checkAlerts() {
 }
 
 // ---------------------------------------------------------------- flight route
-bool ensureRoute(int idx) {
-  if (idx < 0 || idx >= acCount) return false;
-  Aircraft& a = ac[idx];
-  if (a.routeTried || a.flight[0] == 0) return false;
-  a.routeTried = true;
-
+// Jeden synchronny dotaz na adsb.im. Vola ho route task (alebo fallback v loop()).
+bool routeFetchNow(const char* callsign, char* dep, char* arr) {
   JsonDocument requestDoc;
   JsonArray planes = requestDoc["planes"].to<JsonArray>();
   JsonObject plane = planes.add<JsonObject>();
-  plane["callsign"] = a.flight;
+  plane["callsign"] = callsign;
   plane["lat"] = 0;
   plane["lng"] = 0;
   String requestBody;
@@ -881,19 +917,19 @@ bool ensureRoute(int idx) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(8000);
   http.setUserAgent(userAgent);
   if (!http.begin(client, "https://adsb.im/api/0/routeset")) {
     Serial.println("[ROUTE] ERROR: http.begin() failed");
-    return true;
+    return false;
   }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Accept", "application/json");
 
   int httpCode = http.POST(requestBody);
-  Serial.printf("[ROUTE] %s HTTP %d, free heap: %u\n", a.flight, httpCode,
+  Serial.printf("[ROUTE] %s HTTP %d, free heap: %u\n", callsign, httpCode,
                 (unsigned int)ESP.getFreeHeap());
-
+  bool ok = false;
   if (httpCode == HTTP_CODE_OK) {
     String responseBody = http.getString();
     JsonDocument responseDoc;
@@ -904,14 +940,108 @@ bool ensureRoute(int idx) {
         String routeStr = flightInfo["_airport_codes_iata"].as<String>();
         int sep = routeStr.indexOf('-');
         if (sep > 0) {
-          cpy(a.dep, sizeof(a.dep), routeStr.substring(0, sep).c_str());
-          cpy(a.arr, sizeof(a.arr), routeStr.substring(sep + 1).c_str());
+          cpy(dep, 5, routeStr.substring(0, sep).c_str());
+          cpy(arr, 5, routeStr.substring(sep + 1).c_str());
+          ok = true;
         }
       }
     }
   }
   http.end();
-  return true;
+  return ok;
+}
+
+// Background task: dotazy bezia mimo hlavnej slucky, vysledok ide cez routeResult.
+void routeTask(void*) {
+  for (;;) {
+    if (!routeReqPending) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+    RouteReq req;
+    taskENTER_CRITICAL(&routeMux);
+    req = routeReq;
+    routeReqPending = false;
+    routeBusy = true;
+    taskEXIT_CRITICAL(&routeMux);
+
+    char dep[5] = "-", arr[5] = "-";
+    bool ok;
+    {
+      NetLock lock;
+      ok = routeFetchNow(req.flight, dep, arr);
+    }
+    taskENTER_CRITICAL(&routeMux);
+    routeResult.hex = req.hex;
+    cpy(routeResult.dep, sizeof(routeResult.dep), dep);
+    cpy(routeResult.arr, sizeof(routeResult.arr), arr);
+    routeResult.ok = ok;
+    routeResultReady = true;
+    routeBusy = false;
+    taskEXIT_CRITICAL(&routeMux);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// Zaradi lietadlo na dotazenie trasy; vola sa z loop() aj z handlera tlacidla.
+void requestRoute(int idx) {
+  if (idx < 0 || idx >= acCount) return;
+  Aircraft& a = ac[idx];
+  if (a.routeTried || a.flight[0] == 0) return;
+  if (a.routeTries >= ROUTE_MAX_TRIES) { a.routeTried = true; return; }
+  if (millis() < routeRetryAt) return;
+  if (routeReqPending || routeBusy) return;
+
+  if (!routeTaskOk) {
+    // Task sa nepodarilo vytvorit: dotaz synchronne, aby trasa nechybala
+    char dep[5] = "-", arr[5] = "-";
+    bool ok;
+    {
+      NetLock lock;
+      ok = routeFetchNow(a.flight, dep, arr);
+    }
+    a.routeTries++;
+    if (ok) {
+      cpy(a.dep, sizeof(a.dep), dep);
+      cpy(a.arr, sizeof(a.arr), arr);
+      a.routeTried = true;
+      displayCurrentPage();
+    } else if (a.routeTries >= ROUTE_MAX_TRIES) {
+      a.routeTried = true;
+    } else {
+      routeRetryAt = millis() + ROUTE_RETRY_DELAY_MS;
+    }
+    return;
+  }
+
+  taskENTER_CRITICAL(&routeMux);
+  routeReq.hex = a.hex32;
+  cpy(routeReq.flight, sizeof(routeReq.flight), a.flight);
+  routeReqPending = true;
+  taskEXIT_CRITICAL(&routeMux);
+  a.routeTries++;
+}
+
+// Premietne vysledok z tasku do ac[] a prekresli obrazovku.
+void applyRouteResult() {
+  if (!routeResultReady) return;
+  RouteResult res;
+  taskENTER_CRITICAL(&routeMux);
+  res = routeResult;
+  routeResultReady = false;
+  taskEXIT_CRITICAL(&routeMux);
+
+  for (int i = 0; i < acCount; i++) {
+    if (ac[i].hex32 != res.hex || ac[i].routeTried) continue;
+    if (res.ok) {
+      cpy(ac[i].dep, sizeof(ac[i].dep), res.dep);
+      cpy(ac[i].arr, sizeof(ac[i].arr), res.arr);
+      ac[i].routeTried = true;
+    } else if (ac[i].routeTries >= ROUTE_MAX_TRIES) {
+      ac[i].routeTried = true;
+    } else {
+      routeRetryAt = millis() + ROUTE_RETRY_DELAY_MS;
+    }
+    if (i == sel) displayCurrentPage();
+    break;
+  }
 }
 
 // ---------------------------------------------------------------- setup / loop
@@ -921,7 +1051,7 @@ void setup() {
   while (!Serial && millis() - serialT0 < 3000) delay(10);
   delay(1000);
   Serial.println();
-  Serial.println("nearPlane+: start (v4)");
+  Serial.printf("nearPlane+: start (%s)\n", FW_VERSION);
   {
     int rr = (int)esp_reset_reason();
     const char* txt = rr == 1 ? "power-on" : rr == 3 ? "software restart" : rr == 4 ? "PANIC / crash"
@@ -943,6 +1073,10 @@ void setup() {
   canvas.createSprite(M5.Display.width(), M5.Display.height());
   buildFilter();
   loadStats();
+  // Jeden TLS request naraz; cesty sa tahaju v samostatnom tasku (core 0)
+  netMutex = xSemaphoreCreateMutex();
+  routeTaskOk = (xTaskCreatePinnedToCore(routeTask, "route", 16384, nullptr, 1, nullptr, 0) == pdPASS);
+  if (!routeTaskOk) Serial.println("[ROUTE] background task failed, blocking fallback active");
   wifi_ssid = preferences.getString("ssid", "");
   if (wifi_ssid == "") {
     configMode = true;
@@ -966,7 +1100,27 @@ void loop() {
   if (configMode) {
     dnsServer.processNextRequest();
     server.handleClient();
+    // Setup AP sa po 10 min neaktivity vypne, aby nevybijal bateriu.
+    // Pri nabijani (treba USB) ostava zapnuty, aby sa dala konfiguracia dokoncit.
+    if (!M5.Power.isCharging() && millis() - lastActivityTime > CONFIG_MODE_TIMEOUT_MS) {
+      Serial.println("[SETUP] idle timeout, going to sleep");
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_OFF);
+      canvas.fillScreen(TFT_BLACK);
+      canvas.setTextColor(TFT_WHITE);
+      canvas.setTextDatum(MC_DATUM);
+      canvas.setFont(&fonts::FreeSansBold12pt7b);
+      canvas.drawString("Setup timeout", 120, 55);
+      canvas.setFont(&fonts::FreeSans9pt7b);
+      canvas.drawString("Sleeping 60 s...", 120, 85);
+      canvas.pushSprite(0, 0);
+      delay(2000);
+      M5.Display.sleep();
+      M5.Power.deepSleep(DEEP_SLEEP_DURATION_S * 1000000ULL);
+    }
   } else {
+    ensureWifi();
     if (millis() - lastBeat > 5000) {
       lastBeat = millis();
       long left = (long)pollInterval - (long)(millis() - lastPollTime);
@@ -981,10 +1135,8 @@ void loop() {
       fetchAircraftData();
       lastPollTime = millis();
     }
-    if (routePending && !isResetting) {
-      routePending = false;
-      if (ensureRoute(sel)) displayCurrentPage();
-    }
+    applyRouteResult();
+    if (!isResetting) requestRoute(sel);
     if (rateLimited && acCount == 0 && !toastActive() && millis() - lastRedraw > 1000) {
       lastRedraw = millis();                           // refresh the retry countdown
       displayCurrentPage();
@@ -1223,7 +1375,8 @@ void handleButtons() {
     } else if (d < (unsigned long)BTN_B_HOLD_MS && acCount > 1) {
       selectNextAircraft();
       displayCurrentPage();
-      if (ensureRoute(sel)) displayCurrentPage();   // route is fetched only now
+      routeRetryAt = 0;             // manualna zmena vyberu: skus route hned
+      requestRoute(sel);            // dotaz bezi na pozadi, UI nezamrzne
     }
   }
 }
@@ -1242,6 +1395,7 @@ void drawResetScreen(int seconds_left) {
 // ---------------------------------------------------------------- configuration mode
 void startConfigMode() {
   const char* ap_ssid = "nearPlane-ADSB-Tracker-Setup";
+  lastActivityTime = millis();
   canvas.fillScreen(TFT_BLUE);
   canvas.setTextColor(TFT_WHITE);
   canvas.setTextDatum(MC_DATUM);
@@ -1263,6 +1417,38 @@ void startConfigMode() {
   server.on("/save", HTTP_POST, handleSave);
   server.onNotFound(handleNotFound);
   server.begin();
+}
+
+// Wi-Fi watchdog: reconnect s rastucim odstupom, po 10 min fallback do setup rezimu.
+void ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiDownSince) {
+      Serial.println("[WIFI] reconnected");
+      wifiDownSince = 0;
+      wifiBackoff = 0;
+      wifiRetryAt = 0;
+      firstPoll = true;             // hned po obnoveni spojenia nacitaj data
+    }
+    return;
+  }
+  if (wifiDownSince == 0) {
+    wifiDownSince = millis();
+    Serial.println("[WIFI] connection lost, retrying");
+  }
+  if (millis() - wifiDownSince > WIFI_FALLBACK_TIMEOUT_MS) {
+    Serial.println("[WIFI] no connection for 10 min, switching to setup mode");
+    wifiDownSince = 0;
+    configMode = true;
+    startConfigMode();
+    return;
+  }
+  if (millis() < wifiRetryAt) return;
+  wifiBackoff = wifiBackoff ? wifiBackoff * 2 : WIFI_BACKOFF_MIN;
+  if (wifiBackoff > WIFI_BACKOFF_MAX) wifiBackoff = WIFI_BACKOFF_MAX;
+  wifiRetryAt = millis() + wifiBackoff;
+  Serial.printf("[WIFI] reconnect, next try in %lu s\n", wifiBackoff / 1000);
+  WiFi.disconnect();
+  WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
 }
 
 void loadSettingsAndConnect() {
@@ -1306,7 +1492,11 @@ void loadSettingsAndConnect() {
     canvas.drawString("Hold BtnB 5 sec to reset", 120, 90);
     canvas.pushSprite(0, 0);
   } else {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    // TZ string riesi aj letny/zimny cas, netreba prepocitavat offset
+    configTzTime(TZ_INFO, ntpServer);
+    wifiDownSince = 0;
+    wifiBackoff = 0;
+    wifiRetryAt = 0;
     canvas.fillScreen(TFT_DARKGREEN);
     canvas.setTextColor(TFT_WHITE);
     canvas.setTextDatum(MC_DATUM);
@@ -1319,7 +1509,32 @@ void loadSettingsAndConnect() {
   }
 }
 
+// Jednoduchy escape hodnot z NVS pred vlozenim do HTML atributu
+String htmlEscape(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+// Striktne cislo z formulara: odmietne prazdny retazec, "abc", "12x" aj hodnoty mimo rozsahu
+bool parseNum(const String& s, double lo, double hi, double& out) {
+  if (s.length() == 0 || s.length() > 12) return false;
+  char* end = nullptr;
+  double v = strtod(s.c_str(), &end);
+  if (end == s.c_str() || *end != 0) return false;
+  if (!(v >= lo && v <= hi)) return false;
+  out = v;
+  return true;
+}
+
+String setupError(const String& what) {
+  return "<h1>Invalid settings</h1><p>" + what + "</p><p><a href=\"/\">Back</a></p>";
+}
+
 void handleRoot() {
+  lastActivityTime = millis();     // klik na setup stranku resetuje idle timeout
   String html = FPSTR(index_html);
   String lat = "", lon = "", msg;
   bool gpsPosUsable = gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 600000UL;
@@ -1334,14 +1549,24 @@ void handleRoot() {
   } else {
     msg = "No GPS module detected (optional).";
   }
+  // Existujuce hodnoty z NVS: pri opakovanom vstupe do setupu netreba vsetko pisat znova
+  String curSsid = htmlEscape(preferences.getString("ssid", ""));
+  String curRadius = preferences.getString("radius", "50");
+  String curUa = preferences.getString("ua", "");
+  if (curUa == USER_AGENT || curUa.indexOf("changeme@example.com") >= 0) curUa = "";   // dummy sa nepredvypĺňa
   html.replace("%GPSMSG%", msg);
   html.replace("%LAT%", lat);
   html.replace("%LON%", lon);
+  html.replace("%SSID%", curSsid);
+  html.replace("%RADIUS%", curRadius);
+  html.replace("%UA%", htmlEscape(curUa));
   html.replace("%GPSCHK%", gpsEnabled ? "checked" : "");
+  html.replace("%VER%", FW_VERSION);
   server.send(200, "text/html", html);
 }
 
 void handleSave() {
+  lastActivityTime = millis();
   // User-Agent: single line only (no CR/LF header injection), must be a real contact
   String ua = server.arg("user_agent");
   ua.replace("\r", " ");
@@ -1350,18 +1575,41 @@ void handleSave() {
   if (ua.length() < 8 || ua.length() > 120 || ua.indexOf("CHANGE-ME") >= 0 ||
       ua.indexOf("changeme@example.com") >= 0 ||
       (ua.indexOf('@') < 0 && ua.indexOf("http://") < 0 && ua.indexOf("https://") < 0)) {
-    server.send(400, "text/html",
-                "<h1>User-Agent is not valid</h1><p>Enter your real e-mail or a URL (adsb.lol requires contact info).</p>"
-                "<p><a href=\"/\">Back</a></p>");
+    server.send(400, "text/html", setupError("User-Agent is not valid. Enter your real e-mail or a URL "
+                                             "(adsb.lol requires contact info)."));
     return;
   }
+  String ssid = server.arg("ssid");
+  String pass = server.arg("password");
+  double lat = 0, lon = 0, rad = 0;
+  if (ssid.length() == 0 || ssid.length() > 32) {
+    server.send(400, "text/html", setupError("WiFi SSID must have 1-32 characters."));
+    return;
+  }
+  if (pass.length() > 63) {
+    server.send(400, "text/html", setupError("WiFi password is too long (max 63 characters)."));
+    return;
+  }
+  if (!parseNum(server.arg("lat"), -90.0, 90.0, lat)) {
+    server.send(400, "text/html", setupError("Latitude must be a number between -90 and 90."));
+    return;
+  }
+  if (!parseNum(server.arg("lon"), -180.0, 180.0, lon)) {
+    server.send(400, "text/html", setupError("Longitude must be a number between -180 and 180."));
+    return;
+  }
+  if (!parseNum(server.arg("radius"), 1.0, 250.0, rad)) {
+    server.send(400, "text/html", setupError("Scan radius must be a whole number from 1 to 250 NM."));
+    return;
+  }
+  int radius = (int)(rad + 0.5);
   preferences.putString("ua", ua);
   preferences.putBool("gps", server.hasArg("gps"));
-  preferences.putString("ssid", server.arg("ssid"));
-  preferences.putString("password", server.arg("password"));
-  preferences.putString("lat", server.arg("lat"));
-  preferences.putString("lon", server.arg("lon"));
-  preferences.putString("radius", server.arg("radius"));
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", pass);
+  preferences.putString("lat", String(lat, 6));
+  preferences.putString("lon", String(lon, 6));
+  preferences.putString("radius", String(radius));
   server.send(200, "text/html", "<h1>Settings Saved!</h1><p>Device will reboot in 3 seconds.</p>");
   delay(3000);
   ESP.restart();
@@ -1377,7 +1625,7 @@ void drawFooter(bool aircraftPage) {
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(TFT_DARKGREY);
   canvas.setTextDatum(BC_DATUM);
-  canvas.drawString(String(currentPage + 1) + "/" + String(NUM_PAGES), 120, 134);
+  canvas.drawString(String(currentPage + 1) + "/" + String(NUM_PAGES) + "  " + FW_VERSION, 120, 134);
   if (aircraftPage && acCount > 0) {
     canvas.setTextDatum(BR_DATUM);
     canvas.drawString("AC " + String(sel + 1) + "/" + String(acCount), 236, 134);
@@ -1776,6 +2024,7 @@ void commitScan() {
     for (int j = 0; j < acCount; j++) {
       if (cand[i].hex32 == ac[j].hex32) {
         cand[i].routeTried = ac[j].routeTried;
+        cand[i].routeTries = ac[j].routeTries;
         strcpy(cand[i].dep, ac[j].dep);
         strcpy(cand[i].arr, ac[j].arr);
         break;
@@ -1823,6 +2072,7 @@ void fetchAircraftData() {
     Serial.println("[AIRCRAFT] ERROR: WiFi is not connected");
     return;
   }
+  NetLock lock;      // s route taskom sa nikdy nestretnú dva TLS requesty naraz
 
   Serial.println();
   Serial.println("========== AIRCRAFT API ==========");
@@ -1941,8 +2191,8 @@ void fetchAircraftData() {
           bool alert = checkAlerts();
           if (!alert && ac[0].hex32 != lastNearestHex) playNewAircraftSound();
           lastNearestHex = ac[0].hex32;
-          displayCurrentPage();        // show first, route is fetched in loop()
-          routePending = true;
+          displayCurrentPage();        // show first, route is fetched in the background
+          requestRoute(sel);
           pollInterval = SHORT_POLL_INTERVAL;
         } else {
           Serial.println("[AIRCRAFT] no aircraft found.");
