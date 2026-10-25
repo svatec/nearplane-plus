@@ -1,6 +1,6 @@
 # nearPlane+ – Changelog & Controls / Zmeny a ovládanie
 
-nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.1)
+nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.2)
 
 **Language / Jazyk:** [English](#english) · [Slovenčina](#slovenčina)
 
@@ -178,6 +178,114 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - The setup form is prefilled from the stored settings and validated on the device.
 - The footer shows the firmware version; the clock handles daylight saving automatically.
 
+## 8. v4.2 – data quality (phase 1 of 3)
+
+### 8.1 What changed
+
+| # | Before | Now |
+|---|---|---|
+| 1 | `category` was parsed and thrown away | Page 11 shows the emitter category with a readable label (`A3 Large`, `A7 Rotorcraft`, `B6 UAV`, `C1 Emergency veh`…) |
+| 2 | Only the military bit of `dbFlags` was used | `PIA` and `LADD` privacy flags are shown as badges; military alerts still work |
+| 3 | Position source was invisible | `ADS-B` / `MLAT` / `TIS-B` / `ADS-C` is derived from `type` and the `mlat` / `tisb` arrays; shown on page 11 |
+| 4 | Stale targets stayed on screen with dead reckoning | Positions older than 60 s are dimmed; aircraft older than 180 s are dropped (`seen_pos`) |
+| 5 | Units were hardcoded to km/ft | `BtnC` short press toggles km/ft ↔ NM/FL (outside the map), stored in NVS; also selectable in setup |
+| 6 | Ground vehicles and parked aircraft could be the "closest" | Setup option **Hide aircraft on the ground** (default on) |
+| 7 | No data quality view | New page 11: source, age, NIC/RC, NACp/SIL, ADS-B version, QNH/FMS altitude, wind components, registration country |
+| 8 | Country was unknown | Derived from the registration prefix (`OK-`, `D-`, `OM-`, `N-`, …); no unverified hex table |
+| 9 | No flight phase | Page 11 shows `CLB`, `CRZ`, `DES`, `APP`, `TAXI` from altitude and vertical rate |
+
+### 8.2 New API fields
+
+`type`, `seen_pos`, `mlat`, `tisb`, `nic`, `rc`, `nac_p`, `sil`, `sil_type`, `version`, `nav_qnh`, `nav_altitude_fms`, `geom_rate`, `alert`, `spi`. `seen` is requested for diagnostics.
+
+### 8.3 Notes
+
+- `seen_pos` is a floating-point value in the API (e.g. `0.096`); the firmware stores whole seconds.
+- Emitter category, NIC/RC and NACp/SIL are only present when the data source provides them; otherwise the page shows `---`.
+- Country is intentionally derived from the registration, not from the ICAO hex range, because no authoritative hex table was available for verification.
+
+### 8.4 UI clean-up (after first hardware test)
+
+- The bottom status line was removed completely on user request: page number, firmware version, `AC x/y` counter, flight phase and quality badges are no longer drawn. The display now contains only aircraft data; the top alert banner stays.
+- Flight phase moved to page 11 (first row: source + phase + position age).
+- The altitude label on page 1 reads `ALT (FL)` in NM/FL mode and `ALT (ft)` otherwise, so the unit switch is visible.
+- The "Units" toast is shown for 2.5 s and every toggle is logged as `[UI] units=...`.
+
+## 9. v4.2 – watchlist and alert engine (phase 2 of 3)
+
+### 9.1 Watchlist
+
+- Comma separated rules in the setup form (max 10): `OK-*` (registration prefix), `@DLH` (callsign prefix), `A388` (exact type), `4CA123` (exact hex). A trailing `*` means prefix match, otherwise exact.
+- Matching is case-insensitive across registration, callsign, type and hex; stored in NVS under `watch`.
+- A match raises level `WATCH` (magenta), selects the aircraft and plays a dedicated sound. Parsed rules are logged as `[WATCH] N rule(s)`.
+
+### 9.2 Alert engine
+
+| Priority | Event | Colour | Trigger |
+|---|---|---|---|
+| 1 | EMERGENCY | red | emergency flag or squawk 7500/7600/7700 |
+| 2 | CPA | red | CPA within the configured distance/time (default 2 km / 2 min) |
+| 3 | OVERHEAD | yellow | elevation above the configured angle (default 70°) |
+| 4 | MILITARY | orange | `dbFlags` military bit |
+| 5 | WATCH | magenta | watchlist match |
+| 6 | RARE | cyan | hardcoded rare type list |
+
+- All events are evaluated after every poll; the highest priority wins and only one banner is shown.
+- Dedupe is per aircraft **and** event type for 5 minutes (ring of 12), so a CPA is not repeated every 15 s.
+- CPA and overhead values are shown in the header line (`CPA 1.4 km / 90s`, `OVERHEAD 78deg 35000 ft`) and the banner stays for 10 s.
+- Quiet hours (default 22:00–07:00, local time from NTP) suppress sounds only; banners and selection still happen.
+- Every alert type has its own on/off switch in the setup form; thresholds are validated on the device.
+
+### 9.3 Notes
+
+- The legacy 8-entry `alertedHex` ring was replaced by a 12-entry ring with an event type and expiry.
+- New NVS keys: `watch`, `cpaKm`, `cpaMin`, `elev`, `qfrom`, `qto`, `flags`.
+- New serial lines: `[WATCH]`, `[ALERT] <callsign> <text>`.
+
+## 10. v4.2 – storage, caches and OTA (phase 3 of 3)
+
+### 10.1 Flash layout
+
+- Custom `partitions_8mb_ota.csv`: NVS 20 kB, otadata 8 kB, app0/app1 3 MB each, LittleFS 1.94 MB.
+- OTA is only offered when a second application slot exists (`esp_ota_get_next_update_partition()`), so the firmware also runs on the old single-slot layout with OTA disabled.
+- The first flash of the new layout must be done over USB; NVS (settings) is preserved because its offset does not change.
+
+### 10.2 Sightings log (LittleFS)
+
+- `/log.csv`: `time,hex,callsign,reg,type,alt,gs,dist_km,source`, one row per aircraft per 5 minutes.
+- Rotation at 256 kB (`/log.csv` → `/log.old.csv`, the previous old file is deleted).
+- Setup page: `GET /log.csv` (download), `POST /log/clear`, log size in kB and an on/off switch (NVS `log`).
+- Rows are written only after NTP synchronisation; LittleFS is mounted even when logging is disabled so the file can still be downloaded or cleared.
+
+### 10.3 Caches
+
+- Route cache: 24 entries `callsign → dep/arr`, 7 days, NVS `rcache`. A cache hit sets `routeTried` without any network request.
+- Enrichment cache: 24 entries `hex → long type name`, 30 days, NVS `ecache`.
+- Both caches are loaded at boot and logged as `[CACHE]`.
+
+### 10.4 Enrichment
+
+- When the selected aircraft has no long type name and its type is missing from `TYPE_NAMES`, the background task requests `api.adsb.lol/v2/hex/{hex}` and caches `desc` (fallback `ownOp`).
+- Only one enrichment request per selected aircraft, skipped while a route request is in flight and while the remaining quota is below 50.
+
+### 10.5 Data-source quota
+
+- `x-ratelimit-remaining` and `x-ratelimit-reset` are parsed from every response.
+- Below 20 remaining requests the primary source is blocked and the fallback is used; below 5 polling slows to 60 s.
+- All changes are visible in the serial log as `[RATE]`.
+
+### 10.6 OTA
+
+- Setup mode offers `/update` (GET page, POST multipart upload) using `Update.h`; the device reboots after a successful upload.
+- Holding `BtnA` while powering on enters setup mode without a factory reset, so OTA and reconfiguration do not need a settings wipe.
+- Firmware version and OTA availability are shown on the update page.
+
+### 10.7 Notes
+
+- Batch `routeset` requests were **not** implemented: the response mapping could not be verified, so the cache reduces repeat requests instead.
+- New NVS keys: `log`, `rcache`, `ecache`.
+- New serial prefixes: `[LOG]`, `[CACHE]`, `[ENRICH]`, `[RATE]`, `[OTA]`, `[SETUP]`.
+
 ---
 
 <a id="slovenčina"></a>
@@ -351,3 +459,111 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 - Route lookup beží v background tasku, takže displej a tlačidlá reagujú; neúspešné pokusy sa opakujú (60 s, max. 3×).
 - Setup formulár sa predvypĺňa z uložených hodnôt a validuje priamo v zariadení.
 - Pätička zobrazuje verziu firmvéru; hodiny zvládajú letný/zimný čas automaticky.
+
+## 8. v4.2 – kvalita dát (fáza 1 z 3)
+
+### 8.1 Čo sa zmenilo
+
+| # | Predtým | Teraz |
+|---|---|---|
+| 1 | `category` sa parsovala a zahadzovala | Stránka 11 zobrazuje kategóriu s čitateľným popisom (`A3 Large`, `A7 Rotorcraft`, `B6 UAV`, `C1 Emergency veh`…) |
+| 2 | Z `dbFlags` sa používal len military bit | `PIA` a `LADD` privacy flagy sú zobrazené na stránke 11; military alerty fungujú ďalej |
+| 3 | Zdroj pozície nebol vidieť | `ADS-B` / `MLAT` / `TIS-B` / `ADS-C` z poľa `type` a polí `mlat` / `tisb`; zobrazené na stránke 11 |
+| 4 | Zastarané ciele ostávali na obrazovke s dead reckoning | Pozícia staršia ako 60 s je zosivená; lietadlo staršie ako 180 s sa vyradí (`seen_pos`) |
+| 5 | Jednotky boli natvrdo km/ft | `BtnC` short prepína km/ft ↔ NM/FL (mimo mapy), uložené v NVS; aj v setup formulári |
+| 6 | Ground vozidlá a odstavené lietadlá mohli byť „najbližšie" | Setup voľba **Hide aircraft on the ground** (default on) |
+| 7 | Nebol prehľad o kvalite dát | Nová stránka 11: zdroj, vek, NIC/RC, NACp/SIL, ADS-B verzia, QNH/FMS výška, zložky vetra, krajina registrácie |
+| 8 | Krajina nebola známa | Odvodená z prefixu registrácie (`OK-`, `D-`, `OM-`, `N-`, …); žiadna neoverená hex tabuľka |
+| 9 | Nebola fáza letu | Stránka 11 zobrazuje `CLB`, `CRZ`, `DES`, `APP`, `TAXI` z výšky a vertikálnej rýchlosti |
+
+### 8.2 Nové polia API
+
+`type`, `seen_pos`, `mlat`, `tisb`, `nic`, `rc`, `nac_p`, `sil`, `sil_type`, `version`, `nav_qnh`, `nav_altitude_fms`, `geom_rate`, `alert`, `spi`. `seen` sa žiada pre diagnostiku.
+
+### 8.3 Poznámky
+
+- `seen_pos` je v API desatinné číslo (napr. `0.096`); firmware ukladá celé sekundy.
+- Kategória, NIC/RC a NACp/SIL sú dostupné len ak ich zdroj dát poskytuje; inak stránka zobrazí `---`.
+- Krajina sa zámerne odvodzuje z registrácie, nie z ICAO hex rozsahu – overiteľná hex tabuľka nebola k dispozícii.
+
+### 8.4 Vyčistenie UI (po prvom HW teste)
+
+- Spodný stavový riadok bol na žiadosť odstránený celý: číslo strany, verzia firmvéru, počítadlo `AC x/y`, fáza letu ani quality badge sa už nekreslia. Displej obsahuje len dátové polia; horný alert banner ostáva.
+- Fáza letu sa presunula na stránku 11 (prvý riadok: zdroj + fáza + vek pozície).
+- Label výšky na stránke 1 je v režime NM/FL `ALT (FL)`, inak `ALT (ft)`, takže prepnutie jednotiek je vidieť.
+- Toast „Units" je zobrazený 2,5 s a každé prepnutie sa loguje ako `[UI] units=...`.
+
+## 9. v4.2 – watchlist a alert engine (fáza 2 z 3)
+
+### 9.1 Watchlist
+
+- Pravidlá oddelené čiarkou v setup formulári (max. 10): `OK-*` (prefix registrácie), `@DLH` (prefix callsignu), `A388` (presný typ), `4CA123` (presný hex). Hviezdička na konci = prefix, inak presná zhoda.
+- Porovnanie je case-insensitive cez registráciu, callsign, typ a hex; ukladá sa do NVS pod kľúčom `watch`.
+- Zhoda vyvolá level `WATCH` (magenta), vyberie lietadlo a prehrá vlastný tón. Parsované pravidlá sa logujú ako `[WATCH] N rule(s)`.
+
+### 9.2 Alert engine
+
+| Priorita | Event | Farba | Spúšťač |
+|---|---|---|---|
+| 1 | EMERGENCY | červená | emergency flag alebo squawk 7500/7600/7700 |
+| 2 | CPA | červená | CPA v nastavenej vzdialenosti/čase (default 2 km / 2 min) |
+| 3 | OVERHEAD | žltá | elevácia nad nastavený uhol (default 70°) |
+| 4 | MILITARY | oranžová | military bit v `dbFlags` |
+| 5 | WATCH | magenta | zhoda s watchlistom |
+| 6 | RARE | azúrová | pevný zoznam vzácnych typov |
+
+- Všetky eventy sa vyhodnocujú po každom pollе; vyhráva najvyššia priorita a zobrazí sa len jeden banner.
+- Dedupe je pre lietadlo **a** typ eventu na 5 minút (ring 12), takže CPA sa neopakuje každých 15 s.
+- Hodnoty CPA a overhead sú v riadku pod callsignom (`CPA 1.4 km / 90s`, `OVERHEAD 78deg 35000 ft`), banner ostáva 10 s.
+- Tiché hodiny (default 22:00–07:00, lokálny čas z NTP) potláčajú len zvuk; banner a výber fungujú ďalej.
+- Každý typ alertu má vlastný prepínač v setup formulári; prahy sa validujú v zariadení.
+
+### 9.3 Poznámky
+
+- Pôvodný 8-prvkový ring `alertedHex` nahradil 12-prvkový ring s typom eventu a expiráciou.
+- Nové NVS kľúče: `watch`, `cpaKm`, `cpaMin`, `elev`, `qfrom`, `qto`, `flags`.
+- Nové serial riadky: `[WATCH]`, `[ALERT] <callsign> <text>`.
+
+## 10. v4.2 – úložisko, cache a OTA (fáza 3 z 3)
+
+### 10.1 Layout flash
+
+- Vlastná `partitions_8mb_ota.csv`: NVS 20 kB, otadata 8 kB, app0/app1 po 3 MB, LittleFS 1,94 MB.
+- OTA sa ponúka len ak existuje druhý app slot (`esp_ota_get_next_update_partition()`), takže firmware beží aj na starom single-slot layoute s vypnutou OTA.
+- Prvý flash nového layoutu musí ísť cez USB; NVS (nastavenia) ostáva, pretože offset sa nemení.
+
+### 10.2 Log pozorovaní (LittleFS)
+
+- `/log.csv`: `time,hex,callsign,reg,type,alt,gs,dist_km,source`, jeden riadok na lietadlo za 5 minút.
+- Rotácia pri 256 kB (`/log.csv` → `/log.old.csv`, predchádzajúci old sa maže).
+- Setup stránka: `GET /log.csv` (download), `POST /log/clear`, veľkosť logu v kB a on/off prepínač (NVS `log`).
+- Riadky sa zapisujú len po NTP synchronizácii; LittleFS sa mountuje aj pri vypnutom logovaní, aby sa dal súbor stiahnuť alebo zmazať.
+
+### 10.3 Cache
+
+- Route cache: 24 položiek `callsign → dep/arr`, 7 dní, NVS `rcache`. Cache hit nastaví `routeTried` bez sieťového requestu.
+- Enrichment cache: 24 položiek `hex → dlhý názov typu`, 30 dní, NVS `ecache`.
+- Obe cache sa načítajú pri boote a logujú ako `[CACHE]`.
+
+### 10.4 Enrichment
+
+- Ak vybrané lietadlo nemá dlhý názov typu a jeho typ chýba v `TYPE_NAMES`, background task zavolá `api.adsb.lol/v2/hex/{hex}` a uloží `desc` (fallback `ownOp`).
+- Max. jeden enrichment request na vybrané lietadlo, vynechá sa počas route requestu a pri zvyšnej kvóte pod 50.
+
+### 10.5 Kvóta zdroja dát
+
+- `x-ratelimit-remaining` a `x-ratelimit-reset` sa parsujú z každej odpovede.
+- Pod 20 zvyšných requestov sa primary zablokuje a použije sa fallback; pod 5 sa polling spomalí na 60 s.
+- Všetky zmeny sú v serial logu ako `[RATE]`.
+
+### 10.6 OTA
+
+- Setup mód ponúka `/update` (GET stránka, POST multipart upload) cez `Update.h`; po úspešnom uploade sa zariadenie rebootne.
+- Podržanie `BtnA` pri zapnutí vstúpi do setup módu bez factory resetu, takže OTA ani rekonfigurácia nevyžadujú vymazanie nastavení.
+- Verzia firmvéru a dostupnosť OTA sú zobrazené na update stránke.
+
+### 10.7 Poznámky
+
+- Batch `routeset` requesty sa **neimplementovali**: mapovanie odpovede sa nedalo overiť, preto opakovanie requestov rieši cache.
+- Nové NVS kľúče: `log`, `rcache`, `ecache`.
+- Nové serial prefixy: `[LOG]`, `[CACHE]`, `[ENRICH]`, `[RATE]`, `[OTA]`, `[SETUP]`.

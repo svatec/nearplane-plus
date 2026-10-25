@@ -18,18 +18,25 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 ### Tracking and display
 
 - **Real-time tracking** – the closest aircraft's data is updated every few seconds, with dead reckoning between API polls.
-- **Multiple aircraft** – the 5 closest aircraft are tracked; `BtnB` selects the next one (`AC 2/5` in the footer).
-- **Ten-page interface** – flight data, attitude, speeds, autopilot, identity, environment, direction/CPA, radar map, nearby list and daily statistics.
+- **Multiple aircraft** – the 5 closest aircraft are tracked; `BtnB` selects the next one.
+- **Eleven-page interface** – flight data, attitude, speeds, autopilot, identity, environment, direction/CPA, radar map, nearby list, daily statistics and data quality.
+- **Data quality page** – source of the position (ADS-B / MLAT / TIS-B), position age, NIC/RC, NACp/SIL, ADS-B version, emitter category and registration country. Stale targets (>60 s) are dimmed and disappear after 180 s.
+- **Unit switch** – `BtnC` short press toggles km/ft ↔ NM/FL on every page except the map (where it changes the scale). Only distance and altitude fields change: page 1/3/4 altitude (`35000 ft` ↔ `FL350`), pages 7/9/10 distance, page 11 QNH/FMS. Pages 2, 5 and 6 contain no distance or altitude, and speed/wind stay in knots.
 - **Flight route information** – departure and arrival airports (IATA codes) for most commercial flights, fetched once per selected aircraft.
 - **Radar map** – north-up top-down view with up to 40 aircraft, range rings and four scale steps.
 - **Direction and distance** – arrow to the aircraft, distance in km, bearing, approach/recede trend and closest point of approach (CPA).
 - **Type and airline names** – ICAO type codes (`B738` → `Boeing 737-800`) and callsign prefixes (`RYR1234` → `Ryanair`), with a marquee for long header lines.
 - **Daily statistics** – number of aircraft, closest, highest and fastest aircraft of the day, persisted across reboots.
+- **Sightings log** – a CSV log on LittleFS with download and clear buttons on the setup page.
+- **OTA updates** – upload a new `.bin` over the setup access point, no USB needed after the first flash.
+- **Rate-limit aware** – reads `x-ratelimit-remaining` and switches to the fallback source before the daily quota runs out.
 
 ### Alerts and hardware
 
 - **Emergency alerts** – aircraft with emergency squawk codes (7500, 7600, 7700) are highlighted.
-- **Military and rare aircraft alerts** – a coloured banner, a distinct sound and automatic selection of the aircraft.
+- **Military, rare and watchlist alerts** – a coloured banner, a distinct sound and automatic selection of the aircraft. The watchlist matches registrations, callsigns, types and ICAO hex codes (`OK-*`, `SP-*`, `@DLH`, `A388`).
+- **Close-pass and overhead alarms** – a CPA alarm when an aircraft will pass closer than 2 km within 2 minutes, and an overhead alarm when its elevation exceeds 70°. Both thresholds and every alert type can be changed in the setup form.
+- **Quiet hours** – no sounds between 22:00 and 07:00 (configurable); alerts stay visible.
 - **Audible alerts** – a tone plays when a new aircraft is detected; alerts have their own sounds.
 - **Buzzer on/off** – hold `BtnC` for 0.75 seconds (750 ms) to mute or unmute all sounds; the setting is saved.
 - **Live GPS position (optional)** – with an M5Stack GPS Unit v1.1 on the Grove port the tracker uses your current position instead of fixed coordinates; the setup form prefills them from the GPS. See [GPS module](#gps-module-optional).
@@ -126,7 +133,7 @@ pio run -t upload      # flash over USB
 pio device monitor     # serial monitor, 115200 baud
 ```
 
-The project is configured for the 8 MB flash of the Plus 2 (`default_8MB.csv` partition table); with the 4 MB default table the firmware does not fit. GitHub Actions runs the same build on every push and pull request (`.github/workflows/build.yml`).
+The project uses a custom 8 MB partition table (`partitions_8mb_ota.csv`): two 3 MB application slots for OTA updates and a ~1.9 MB LittleFS partition for the sightings log. With the 4 MB default table the firmware does not fit. **Flashing this layout the first time requires USB** (`pio run -t upload`, or the Arduino IDE with an equivalent OTA partition scheme); after that, updates can be uploaded over the setup access point. GitHub Actions runs the same build on every push and pull request (`.github/workflows/build.yml`).
 
 ### Device configuration
 
@@ -140,7 +147,15 @@ After a successful flash, the device boots into **SETUP MODE** for the first tim
    - **Your Latitude** – e.g. `41.015000`. Prefilled when a GPS module has a fix.
    - **Your Longitude** – e.g. `28.97000`. Prefilled when a GPS module has a fix.
    - **Scan Radius (NM, max 250)** – the radius around your location, in nautical miles (e.g. `50`; 1 NM = 1.852 km). Prefilled with the stored value.
+   - **Units** – km/ft (default) or NM/FL. Can also be switched with `BtnC` outside the map.
+   - **Hide aircraft on the ground** – enabled by default; ground targets are left out of the list and the map.
    - **User-Agent** – your e-mail or URL; the value is stored in flash and used for adsb.lol, adsb.fi and route requests. Prefilled when already set.
+   - **Watchlist** – comma separated patterns: `OK-*` (registration prefix), `SP-*`, `@DLH` (callsign prefix), `A388` (type), `4CA123` (hex). Up to 10 rules.
+   - **CPA alarm distance / time window** – defaults 2 km and 2 minutes.
+   - **Overhead alarm elevation** – default 70°.
+   - **Quiet hours** – from/to in whole hours (default 22–07); set both to the same value to disable.
+   - **Alarm toggles** – emergency, military, rare, watchlist, CPA and overhead can be switched off individually.
+   - **Log sightings to flash** – writes a CSV row per aircraft per 5 minutes to LittleFS (enabled by default).
    - **Use GPS module if connected** – checkbox, enabled by default; untick it to always use the coordinates above.
 4. Click **Save & Reboot**.
 
@@ -149,6 +164,26 @@ Values are validated on the device: the SSID must have 1–32 characters, latitu
 The device saves the settings, restarts, connects to your Wi-Fi and starts tracking. Stats and the clock require a working NTP connection.
 
 The setup access point switches itself off after 10 minutes of inactivity (it stays on while charging). The form is prefilled from flash, so reconfiguring does not require retyping the SSID, radius or User-Agent.
+
+The page also offers **Download log**, **Clear log** and **Firmware update**. Hold `BtnA` while powering the device on to enter setup mode without a factory reset.
+
+### Sightings log
+
+Every aircraft is written to `/log.csv` on LittleFS at most once per 5 minutes:
+
+```csv
+2026-10-25T21:50:12,4bb4f0,MGH795,TC-MGP,B738,36000,450,12.3,ADS-B
+time,hex,callsign,reg,type,alt_ft,gs_kt,dist_km,source
+```
+
+- Download from the setup page (`/log.csv`), clear with the button (`/log/clear`).
+- Rotation at 256 kB: the current file becomes `/log.old.csv`, the previous old file is deleted.
+- Rows are only written when NTP has synchronised, otherwise the timestamp would be wrong.
+- The log can be disabled without losing the ability to download or clear it.
+
+### Firmware update (OTA)
+
+The custom partition table has two 3 MB application slots, so a new `.bin` can be uploaded from the setup page (`/update`) without USB. Hold `BtnA` at power-on, connect to `nearPlane-ADSB-Tracker-Setup`, open `http://192.168.4.1/update` and upload the `firmware.bin` built by PlatformIO or exported from the Arduino IDE. The device validates the image, reboots into it and keeps the previous slot as a rollback target. OTA is not available if the device runs a partition layout without a second app slot.
 
 If a GPS module is connected, the setup page says whether it has a fix. Without a fix it asks you to reload the page later (values you typed are lost on reload), or you can simply enter the coordinates by hand.
 
@@ -177,11 +212,12 @@ Notes:
 
 | Page | `BtnA` short | `BtnA` long (0.6 s) | `BtnB` short | `BtnB` hold 1 s → 5 s | `BtnC` short (side/PWR) |
 |---|---|---|---|---|---|
-| 1–6 Aircraft data | next page | next page | next aircraft | countdown → reset | – |
-| 7 Direction / CPA | next page | next page | next aircraft | countdown → reset | – |
+| 1–6 Aircraft data | next page | next page | next aircraft | countdown → reset | units km/ft ↔ NM/FL |
+| 7 Direction / CPA | next page | next page | next aircraft | countdown → reset | units km/ft ↔ NM/FL |
 | **8 Radar map** | next page | **jump to page 1 (detail)** | next aircraft **inside current scale** | countdown → reset | **change scale** |
-| 9 Nearby list | next page | next page | next aircraft (highlighted row) | countdown → reset | – |
-| 10 Statistics | next page | next page | – (no visible effect) | countdown → reset | – |
+| 9 Nearby list | next page | next page | next aircraft (highlighted row) | countdown → reset | units km/ft ↔ NM/FL |
+| 10 Statistics | next page | next page | – (no visible effect) | countdown → reset | units km/ft ↔ NM/FL |
+| 11 Data quality | next page | next page | next aircraft | countdown → reset | units km/ft ↔ NM/FL |
 
 Notes:
 
@@ -189,6 +225,7 @@ Notes:
 - `BtnC` is the third button of the StickC Plus 2 (the power button, exposed as `M5.BtnPWR`).
 - **`BtnC` hold 0.75 seconds (750 ms) on any page toggles the buzzer.** A "Sound ON/OFF" message appears, and a crossed-out speaker icon is shown next to the battery while muted. The setting survives reboots and is cleared by a settings reset. Alerts remain visible; only the sounds are muted.
 - `BtnC` short press acts on release, so it can be distinguished from the 0.75-second hold.
+- Outside the map, `BtnC` short press switches between **km/ft** and **NM/FL**; the choice is stored in flash.
 - Releasing `BtnB` during the reset countdown cancels the reset.
 
 ### BtnC behaviour
@@ -197,7 +234,7 @@ Notes:
 stateDiagram-v2
     [*] --> Idle
     Idle --> Pressed: BtnC down
-    Pressed --> Idle: release before 0.75 s → change map scale (map page only)
+    Pressed --> Idle: release before 0.75 s → map: change scale; other pages: toggle units
     Pressed --> Toggled: held 0.75 s
     Toggled --> Idle: release (buzzer toggled, saved)
 ```
@@ -229,7 +266,7 @@ stateDiagram-v2
 
 ### Pages
 
-Ten pages, advanced with `BtnA`. Pages 1–7 show the currently selected aircraft; pages 8–10 are overview pages.
+Eleven pages, advanced with `BtnA`. Pages 1–7 show the currently selected aircraft; pages 8–11 are overview pages.
 
 ```mermaid
 flowchart LR
@@ -243,19 +280,22 @@ flowchart LR
     P8["8 Radar map<br/>north-up, scalable"]
     P9["9 Nearby list<br/>5 closest aircraft"]
     P10["10 Statistics<br/>today's records"]
+    P11["11 Data quality<br/>SRC / NIC / NACp"]
 
     P1 -->|BtnA| P2 -->|BtnA| P3 -->|BtnA| P4 -->|BtnA| P5 -->|BtnA| P6 -->|BtnA| P7
-    P7 -->|BtnA| P8 -->|BtnA| P9 -->|BtnA| P10 -->|BtnA| P1
+    P7 -->|BtnA| P8 -->|BtnA| P9 -->|BtnA| P10 -->|BtnA| P11 -->|BtnA| P1
     P8 -. "BtnA long press (0.6 s)" .-> P1
     P8 -. "BtnC: scale 100% / 25 / 12.5 / 7.5 km" .-> P8
 
     classDef aircraft fill:#1f3a5f,stroke:#4a90d9,color:#fff;
     classDef overview fill:#2d4a2d,stroke:#6abf69,color:#fff;
     class P1,P2,P3,P4,P5,P6,P7 aircraft;
-    class P8,P9,P10 overview;
+    class P8,P9,P10,P11 overview;
 ```
 
-An **alert** (emergency, military or rare aircraft) automatically selects that aircraft, jumps to page 1 and plays a sound.
+An **alert** (emergency, military, watchlist, rare aircraft, close pass or overhead) automatically selects that aircraft, jumps to page 1 and plays a sound (unless quiet hours are active).
+
+**Page 11 – data quality** shows the source of the position (`ADS-B`, `MLAT`, `TIS-B`, `ADS-C`), phase of flight (`CLB`, `CRZ`, `DES`, `APP`, `TAXI`) with its age in seconds, NIC/RC, NACp/SIL, ADS-B version, emitter category (e.g. `A3 Large`, `A7 Rotorcraft`), wind components and the registration country derived from the registration prefix. There is no status footer: pages contain only the data itself, and the version is shown in the setup page and the serial banner.
 
 ### Radar map scale
 
@@ -266,17 +306,20 @@ flowchart LR
     S0["Full radius<br/>(from setup)"] -->|BtnC| S1["25 km"] -->|BtnC| S2["12.5 km"] -->|BtnC| S3["7.5 km"] -->|BtnC| S0
 ```
 
-Steps not smaller than the configured radius are skipped. If the selected aircraft is outside the current scale, it is shown as a yellow dot on the rim and its distance appears in the footer (e.g. `SEL 24.1 km`).
+Steps not smaller than the configured radius are skipped. If the selected aircraft is outside the current scale, it is shown as a yellow dot on the rim and its distance is drawn on the map (e.g. `SEL 24.1 km`).
 
 ### Alerts
 
-| Level | Banner colour | Trigger |
+| Event | Banner colour | Trigger |
 |---|---|---|
 | EMERGENCY | red | emergency flag or squawk 7500 / 7600 / 7700 |
+| CPA | red | closest point of approach below the configured distance and time (default 2 km / 2 min) |
+| OVERHEAD | yellow | elevation above the configured angle (default 70°) |
 | MILITARY | orange | military flag in the database |
+| WATCH | magenta | registration / callsign / type / hex matches the watchlist |
 | RARE | cyan | A380, B747-400/-8/SP, An-124, An-225, Beluga/BelugaXL, Dreamlifter, C-5M, Il-76, A340-600 |
 
-The same aircraft does not trigger the alert twice (the last 8 are remembered). Alerted aircraft are kept in the list of 5 even when they are not the closest.
+Each event is evaluated after every poll and the highest priority wins (emergency → CPA → overhead → military → watch → rare). The same aircraft does not repeat the same alert for 5 minutes, and alerted aircraft are kept in the list of 5 even when they are not the closest. CPA and overhead alerts show their value in the header line (e.g. `CPA 1.4 km / 90s`); every alert type can be disabled in the setup form. Sounds are muted during quiet hours, but the banner and selection still happen.
 
 ## How it works
 
@@ -330,6 +373,9 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 | Setup Wi-Fi disappeared while configuring | Setup-mode idle timeout (10 minutes, paused while charging). Power-cycle the device to reopen it, or hold `BtnB` 5 s for a settings reset |
 | Clock off by one hour | `TZ_INFO` does not match your timezone; the default is CET/CEST with automatic daylight saving |
 | Route stays `- > -` | The route lookup failed 3 times for that aircraft; select another aircraft or wait for the next poll |
+| Log is empty | NTP has not synchronised yet, logging is disabled in setup, or the aircraft list is empty; check `[LOG]` in the serial output |
+| Firmware update page says "no second app slot" | The device was flashed with the old partition table; flash `partitions_8mb_ota.csv` over USB once |
+| Settings missing after a partition change | NVS is preserved at its fixed offset; if you erased the whole flash, reconfigure the device |
 
 ### Diagnostics (serial)
 
@@ -341,6 +387,14 @@ The serial monitor (115200 baud) prints one prefixed line per subsystem:
 | `[WIFI]` | connection lost / reconnect attempt with backoff / reconnected / fallback to setup mode |
 | `[SETUP]` | setup access point idle timeout |
 | `[ROUTE]` | background route lookup result and HTTP code |
+| `[ALERT]` | triggered alert with its callsign and banner text |
+| `[WATCH]` | number of parsed watchlist rules |
+| `[UI]` | `BtnC` press/release timings, unit and sound changes |
+| `[LOG]` | LittleFS mount, rotation, cleared log |
+| `[CACHE]` | number of route and enrichment entries loaded from NVS |
+| `[ENRICH]` | background `/v2/hex` lookup and cache writes |
+| `[RATE]` | remaining data-source quota and proactive switch to the fallback |
+| `[OTA]` | firmware upload progress and result |
 | `[AIRCRAFT]` | API poll, HTTP status, scan counters, heap before/after TLS |
 | `[GPS]` | module detection, pin/baud combination, fix state |
 
@@ -349,6 +403,17 @@ The serial monitor (115200 baud) prints one prefixed line per subsystem:
 - Primary: [adsb.lol](https://adsb.lol) (open data, ODbL).
 - Fallback while adsb.lol rate-limits: [adsb.fi open data](https://adsb.fi) – personal, non-commercial use only; credit adsb.fi and link to https://adsb.fi.
 - Route lookup: adsb.im.
+- Type enrichment: `api.adsb.lol/v2/hex/{hex}`, only for aircraft whose type is not in the local table, cached for 30 days.
+
+### Data-source quota
+
+adsb.lol allows a limited number of requests per day (the API returns `x-ratelimit-remaining` and `x-ratelimit-reset`, currently 500/day per IP). The firmware reads both headers:
+
+- below 20 remaining requests the primary source is blocked and the fallback (adsb.fi) is used;
+- below 5 remaining requests polling slows to 60 s;
+- enrichment requests are skipped while the remaining quota is below 50.
+
+Route lookups are cached for 7 days per callsign (`rcache` in NVS), enrichment results for 30 days (`ecache`), so repeat requests are avoided.
 
 ## Limitations
 
@@ -358,6 +423,9 @@ The serial monitor (115200 baud) prints one prefixed line per subsystem:
 - Built-in type/airline tables cover about 100 types and 80 airlines; extend `TYPE_NAMES` / `AIRLINES` in the sketch.
 - The scan radius is entered in nautical miles (max 250), not kilometres.
 - The setup access point is open (no password) and serves plain HTTP; configure the device at home, not in a public place.
+- Position quality fields (`MLAT`, `NIC`, `RC`, `NACp`, `SIL`) are provided by the data source; when the API omits them the page shows `---`.
+- The sightings log needs NTP for timestamps and rotates at 256 kB per file (two files max).
+- OTA works only while the device is in setup mode (access point), not over the local Wi-Fi network.
 
 ## Changelog
 
@@ -377,7 +445,7 @@ The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md
 - Fixed HTTP 403/426/429 handling, automatic adsb.fi fallback, configurable User-Agent in the setup form, exponential polling backoff and serial diagnostics.
 - Setup radius corrected to nautical miles (max 250) and deep sleep after inactivity.
 - Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, live position and prefilled setup form.
-- **v4.1 – robustness:** Wi-Fi auto-reconnect with backoff and fallback to the setup AP, setup-mode idle timeout, route lookup moved to a background task (UI and buttons no longer freeze) with up to 3 retries, server-side validation of the setup form, prefilled setup fields, automatic daylight saving via `TZ_INFO`, firmware version in the footer and setup page.
+- **v4.1 – robustness:** Wi-Fi auto-reconnect with backoff and fallback to the setup AP, setup-mode idle timeout, route lookup moved to a background task (UI and buttons no longer freeze) with up to 3 retries, server-side validation of the setup form, prefilled setup fields, automatic daylight saving via `TZ_INFO`, firmware version in the setup page and serial banner.
 - **v4.1 – build:** `platformio.ini` with pinned library versions, GitHub Actions compile check, build artifacts and `.DS_Store` removed from git.
 
 ### Upstream history

@@ -18,6 +18,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <strings.h>
 #include <time.h>
 #include <math.h>
 #include <esp_system.h>
@@ -41,7 +45,7 @@ DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
 // Firmware version, shown in the footer, in the setup page and in the serial banner
-const char* FW_VERSION = "v4.1";
+const char* FW_VERSION = "v4.2";
 
 // Default User-Agent, used only when none is saved in the setup form.
 // adsb.lol requires a User-Agent with real contact info (e-mail or URL).
@@ -53,7 +57,8 @@ const int PAGE_TRACK = 6;   // arrow + distance + CPA
 const int PAGE_MAP   = 7;   // radar map
 const int PAGE_LIST  = 8;   // list of nearest aircraft
 const int PAGE_STATS = 9;   // daily statistics
-const int NUM_PAGES  = 10;
+const int PAGE_DATA  = 10;  // data quality / source details
+const int NUM_PAGES  = 11;
 
 // ---------------------------------------------------------------- polling
 const unsigned long SHORT_POLL_INTERVAL = 15000;        // aircraft found: 15 s
@@ -101,13 +106,21 @@ struct Aircraft {
   char flight[9], reg[12], type[6], hex[8], squawk[6], emergency[14], category[4];
   char navModes[24], desc[26], dep[5], arr[5];
   bool routeTried, onGround, hasPos, hasTrack, hasHdg;
+  bool watched;           // matches the user watchlist
   uint8_t routeTries;     // failed route lookups (retried up to ROUTE_MAX_TRIES)
   uint8_t level;          // 0 = none, 1 = rare type, 2 = military, 3 = emergency
+  // data quality / source (readsb: type, mlat, tisb, seen_pos, nic, rc, nac_p, sil)
+  uint8_t srcFlags;       // 1 = ADS-B, 2 = MLAT, 4 = TIS-B, 8 = ADS-C, 16 = other
+  uint8_t nic, nacp, sil, adsbVer;
+  uint16_t rc;            // radius of containment, m
+  int16_t seenPos;        // seconds since the last position (-1 = unknown)
+  int8_t phase;           // 0 = TAXI, 1 = APPROACH, 2 = CLIMB, 3 = CRUISE, 4 = DESCENT
   uint16_t dbFlags;
   uint32_t hex32;
   double lat, lon, distNm, bearing;
   float gs, track, hdg, roll, mach, navHdg, rssi;
-  int altBaro, altGeom, baroRate, ias, tas, navAlt, tat, oat, wd, ws;
+  float navQnh, headwind, crosswind;
+  int altBaro, altGeom, baroRate, ias, tas, navAlt, navAltFms, tat, oat, wd, ws, geomRate;
 };
 
 struct Blip {             // lightweight version for the radar map
@@ -116,6 +129,7 @@ struct Blip {             // lightweight version for the radar map
   float track, gs;
   bool hasTrack;
   uint8_t level;
+  int16_t seenPos;
 };
 
 struct Rel {              // aircraft position relative to us
@@ -220,8 +234,6 @@ bool statsActive = false;
 unsigned long lastStatsSave = 0;
 
 uint32_t lastNearestHex = 0;
-uint32_t alertedHex[8] = {0};
-int alertedIdx = 0;
 unsigned long lastRedraw = 0;
 
 // ---------------------------------------------------------------- route lookup (background task)
@@ -278,6 +290,66 @@ unsigned long lastHomeUpdate = 0;
 const int GPS_PINS[2][2] = {{33, 32}, {32, 33}};   // {RX, TX}: both Grove wire orientations
 const long GPS_BAUDS[2] = {115200, 9600};          // v1.1 (AT6668) = 115200, v1 (AT6558) = 9600
 bool soundOn = true;                 // buzzer enabled (persisted in NVS)
+int unitsMode = 0;                   // 0 = km / ft, 1 = NM / FL (NVS "units")
+bool hideGround = true;              // hide aircraft on the ground (NVS "gnd")
+
+// ---------------------------------------------------------------- watchlist / alert settings (P2)
+#define WATCH_MAX 10
+struct WatchRule { char pat[13]; };
+WatchRule watchRules[WATCH_MAX];
+int watchCount = 0;
+String watchList;                    // raw value from NVS ("watch")
+
+float cpaThresholdKm = 2.0f;         // CPA alarm distance
+int cpaThresholdMin = 2;             // CPA alarm time window
+int overheadElev = 70;               // overhead alarm elevation, degrees
+int quietFrom = 22, quietTo = 7;     // quiet hours (local time); equal = disabled
+uint16_t alertFlags = 0x003F;        // 1 emergency, 2 military, 4 rare, 8 watch, 16 CPA, 32 overhead
+
+// alert banner for CPA / overhead (level alerts use Aircraft::level)
+uint8_t bannerKind = 0;              // 5 = CPA, 6 = overhead
+uint32_t bannerHex = 0;
+unsigned long bannerUntil = 0;
+String bannerText;
+
+// dedupe ring: one alert per aircraft and kind per 5 minutes
+struct AlertSeen { uint32_t hex; uint8_t kind; unsigned long until; };
+AlertSeen alertSeen[12];
+uint8_t alertSeenIdx = 0;
+const unsigned long ALERT_DEDUPE_MS = 300000UL;
+const unsigned long BANNER_MS = 10000UL;
+
+// ---------------------------------------------------------------- P3: storage, caches, quota
+#define RCACHE_MAX 24
+struct RouteCacheEntry { char cs[9]; char dep[5]; char arr[5]; uint32_t expires; };
+RouteCacheEntry rcache[RCACHE_MAX];
+uint8_t rcacheCount = 0;
+const uint32_t ROUTE_CACHE_TTL = 7UL * 24 * 3600;     // 7 days
+
+#define ENRICH_MAX 24
+struct EnrichEntry { uint32_t hex; char desc[24]; uint32_t expires; };
+EnrichEntry enrichCache[ENRICH_MAX];
+uint8_t enrichCount = 0;
+const uint32_t ENRICH_CACHE_TTL = 30UL * 24 * 3600;   // 30 days
+
+volatile bool enrichPending = false;   // one enrichment request at a time
+uint32_t enrichHex = 0;
+uint32_t enrichTriedHex = 0;           // do not retry the same aircraft every poll
+volatile bool enrichResultReady = false;
+uint32_t enrichResultHex = 0;
+char enrichResultDesc[24];
+
+bool logEnabled = true;                // NVS "log"
+bool logMounted = false;
+uint32_t logBytes = 0;
+const uint32_t LOG_ROTATE_BYTES = 262144;   // 256 kB per file
+
+struct LogSeen { uint32_t hex; unsigned long until; };
+LogSeen logSeen[32];
+uint8_t logSeenIdx = 0;
+
+int rateRemaining = -1;                // x-ratelimit-remaining of the last response
+long rateReset = 0;                    // x-ratelimit-reset in seconds
 bool btnCDown = false, btnCToggled = false;
 unsigned long btnCStart = 0;
 const unsigned long BTN_C_HOLD_MS = 750;   // hold BtnC this long to toggle the buzzer
@@ -356,7 +428,7 @@ const char* RARE_TYPES[] = {
 #define KV_COUNT(x) (sizeof(x) / sizeof(x[0]))
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="32" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="%RADIUS%" min="1" max="250" required><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="%UA%" maxlength="120" placeholder="nearPlane-M5Stick/1.0 (you@example.com)" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><button type="submit">Save & Reboot</button></form></div><div class="footer">nearPlane+ %VER% - M5StickC Plus 2 Edition</div></body></html>
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input,select{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus,select:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="32" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="%RADIUS%" min="1" max="250" required><label for="units">Units</label><select id="units" name="units"><option value="km"%SELKM%>km / ft</option><option value="nm"%SELNM%>NM / FL</option></select><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="%UA%" maxlength="120" placeholder="nearPlane-M5Stick/1.0 (you@example.com)" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label for="watch">Watchlist (comma separated: OK-*, SP-*, @DLH, A388, 4CA123)</label><input type="text" id="watch" name="watch" value="%WATCH%" maxlength="120" placeholder="OK-*, SP-*, @DLH"><label for="cpakm">CPA alarm distance (km, 0.5-20)</label><input type="number" id="cpakm" name="cpakm" value="%CPAKM%" min="0.5" max="20" step="0.5" required><label for="cpamin">CPA alarm time window (minutes, 1-15)</label><input type="number" id="cpamin" name="cpamin" value="%CPAMIN%" min="1" max="15" required><label for="elev">Overhead alarm elevation (degrees, 30-89)</label><input type="number" id="elev" name="elev" value="%ELEV%" min="30" max="89" required><label for="qfrom">Quiet hours (from / to, 0-23; equal = off)</label><input type="number" id="qfrom" name="qfrom" value="%QFROM%" min="0" max="23" required><input type="number" id="qto" name="qto" value="%QTO%" min="0" max="23" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_emerg" value="1" style="width:auto;margin:0 10px 0 0" %A_EMERG%>Alarm: emergency</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_mil" value="1" style="width:auto;margin:0 10px 0 0" %A_MIL%>Alarm: military</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_rare" value="1" style="width:auto;margin:0 10px 0 0" %A_RARE%>Alarm: rare type</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_watch" value="1" style="width:auto;margin:0 10px 0 0" %A_WATCH%>Alarm: watchlist</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_cpa" value="1" style="width:auto;margin:0 10px 0 0" %A_CPA%>Alarm: close pass (CPA)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_over" value="1" style="width:auto;margin:0 10px 0 0" %A_OVER%>Alarm: overhead</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gnd" value="1" style="width:auto;margin:0 10px 0 0" %GNDCHK%>Hide aircraft on the ground</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="log" value="1" style="width:auto;margin:0 10px 0 0" %LOGCHK%>Log sightings to flash (CSV)</label><button type="submit">Save & Reboot</button></form><button type="button" onclick="location.href='/log.csv'" style="background:#34c759;margin-bottom:10px">Download log (%LOGSIZE% kB)</button><form action="/log/clear" method="POST"><button type="submit" style="background:#86868b;margin-bottom:10px">Clear log</button></form><button type="button" onclick="location.href='/update'" style="background:#ff9500">Firmware update</button></div><div class="footer">nearPlane+ %VER% - M5StickC Plus 2 Edition</div></body></html>
 )rawliteral";
 
 // ---------------------------------------------------------------- prototypes
@@ -384,6 +456,20 @@ bool toastActive();
 void ensureWifi();
 void requestRoute(int idx);
 void applyRouteResult();
+bool enrichFetchNow(uint32_t hex, char* descOut);
+bool logBegin();
+void logAircraft(const Aircraft& a);
+void applyCachedEnrichment(Aircraft& a);
+void applyEnrichmentResult();
+void maybeEnrichSelected();
+bool routeCacheLookup(const char* cs, char* dep, char* arr);
+void routeCacheStore(const char* cs, const char* dep, const char* arr);
+void loadCaches();
+bool otaAvailable();
+void handleLogCsv();
+void handleLogClear();
+void handleOtaPage();
+void handleOtaUpload();
 
 // ---------------------------------------------------------------- helper functions
 static void cpy(char* dst, size_t n, const char* src) {
@@ -393,6 +479,7 @@ static void cpy(char* dst, size_t n, const char* src) {
 }
 
 uint32_t levelColor(uint8_t level) {
+  if (level == 4) return TFT_MAGENTA;    // WATCH
   if (level >= 3) return TFT_RED;
   if (level == 2) return TFT_ORANGE;
   return TFT_CYAN;                       // RARE
@@ -404,6 +491,7 @@ uint32_t levelTextColor(uint8_t level) {
 }
 
 const char* levelName(uint8_t level) {
+  if (level == 4) return "WATCH";
   if (level >= 3) return "EMERGENCY";
   if (level == 2) return "MILITARY";
   return "RARE";
@@ -432,15 +520,160 @@ const char* airlineName(const Aircraft& a) {
   return nullptr;
 }
 
+// ---------------------------------------------------------------- watchlist (P2)
+// Pravidla: OK-* (prefix registracie), @DLH (prefix callsignu), A388 (presny typ),
+// 4CA123 (presny hex). Hviezdicka na konci = prefix, inak presna zhoda.
+bool matchWatchRule(const Aircraft& a, const char* raw) {
+  char p[13];
+  cpy(p, sizeof(p), raw);
+  size_t n = strlen(p);
+  bool prefix = false;
+  if (n && p[n - 1] == '*') { p[n - 1] = 0; prefix = true; n--; }
+  if (!n) return false;
+  if (p[0] == '@') {
+    const char* q = p + 1;
+    return strncasecmp(a.flight, q, strlen(q)) == 0;
+  }
+  const char* fields[4] = {a.reg, a.flight, a.type, a.hex};
+  for (int i = 0; i < 4; i++) {
+    if (!fields[i][0]) continue;
+    if (prefix) {
+      if (strncasecmp(fields[i], p, n) == 0) return true;
+    } else {
+      if (strcasecmp(fields[i], p) == 0) return true;
+    }
+  }
+  return false;
+}
+
+bool matchWatch(const Aircraft& a) {
+  for (int i = 0; i < watchCount; i++) {
+    if (matchWatchRule(a, watchRules[i].pat)) return true;
+  }
+  return false;
+}
+
+// "OK-*, SP-*, @DLH" -> watchRules[]; vzory sa ukladaju velkymi pismenami
+void parseWatchlist() {
+  watchCount = 0;
+  int start = 0;
+  while (start < (int)watchList.length() && watchCount < WATCH_MAX) {
+    int comma = watchList.indexOf(',', start);
+    String part = watchList.substring(start, comma < 0 ? watchList.length() : comma);
+    part.trim();
+    part.toUpperCase();
+    if (part.length() > 0) cpy(watchRules[watchCount++].pat, sizeof(watchRules[0].pat), part.c_str());
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  Serial.printf("[WATCH] %d rule(s)\n", watchCount);
+}
+
 uint8_t interestLevel(const Aircraft& a) {
   if ((a.emergency[0] && strcmp(a.emergency, "none") != 0) ||
       strcmp(a.squawk, "7700") == 0 || strcmp(a.squawk, "7600") == 0 ||
       strcmp(a.squawk, "7500") == 0) return 3;
   if (a.dbFlags & 1) return 2;
+  if (a.watched) return 4;
   for (size_t i = 0; i < KV_COUNT(RARE_TYPES); i++) {
     if (strcmp(a.type, RARE_TYPES[i]) == 0) return 1;
   }
   return 0;
+}
+
+// ---------------------------------------------------------------- units / quality helpers (P1)
+// 0 = km / ft, 1 = NM / FL; volba je v NVS ("units") a prepina sa BtnC
+String fmtDistKm(double km) {
+  if (unitsMode) return String(km / 1.852, 1) + " NM";
+  return String(km, 1) + " km";
+}
+
+String fmtAlt(int ft) {
+  if (unitsMode && ft >= 5000) return "FL" + String(ft / 100);
+  return String(ft) + " ft";
+}
+
+// kratky nazov fazy letu do paticky
+const char* phaseName(uint8_t p) {
+  switch (p) {
+    case 0: return "TAXI";
+    case 1: return "APP";
+    case 2: return "CLB";
+    case 4: return "DES";
+    default: return "CRZ";
+  }
+}
+
+// ICAO emitter category -> kratky popis
+const char* categoryLabel(const char* c) {
+  if (!c || !c[0]) return "N/A";
+  if (c[0] == 'A') {
+    switch (c[1]) {
+      case '1': return "Light";
+      case '2': return "Small";
+      case '3': return "Large";
+      case '4': return "High vortex";
+      case '5': return "Heavy";
+      case '6': return "High perf";
+      case '7': return "Rotorcraft";
+    }
+  } else if (c[0] == 'B') {
+    switch (c[1]) {
+      case '1': return "Glider";
+      case '2': return "Balloon";
+      case '3': return "Parachute";
+      case '4': return "Ultralight";
+      case '6': return "UAV";
+      case '7': return "Space";
+    }
+  } else if (c[0] == 'C') {
+    switch (c[1]) {
+      case '1': return "Emergency veh";
+      case '2': return "Service veh";
+      case '3': return "Point obst";
+      case '4': return "Cluster obst";
+      case '5': return "Line obst";
+    }
+  }
+  return c;
+}
+
+// Krajina z prefixu registracie (OK-, D-, OM-, N...). Hex tabulka by bola neoverena.
+struct RegPrefix { const char* p; const char* iso; };
+const RegPrefix REG_PREFIX[] = {
+  {"OK-", "CZ"}, {"OM-", "SK"}, {"OE-", "AT"}, {"OO-", "BE"}, {"OY-", "DK"},
+  {"OH-", "FI"}, {"LN-", "NO"}, {"SE-", "SE"}, {"PH-", "NL"}, {"LX-", "LU"},
+  {"HB-", "CH"}, {"CS-", "PT"}, {"EI-", "IE"}, {"ES-", "EE"}, {"YL-", "LV"},
+  {"LY-", "LT"}, {"LZ-", "BG"}, {"YR-", "RO"}, {"HA-", "HU"}, {"SP-", "PL"},
+  {"9A-", "HR"}, {"S5-", "SI"}, {"4O-", "ME"}, {"Z3-", "MK"}, {"F-", "FR"},
+  {"G-", "GB"}, {"I-", "IT"}, {"EC-", "ES"}, {"TC-", "TR"}, {"UR-", "UA"},
+  {"EW-", "BY"}, {"N", "US"}, {"C-", "CA"}, {"VH-", "AU"}, {"ZK-", "NZ"},
+  {"JA", "JP"}, {"9V-", "SG"}, {"VT-", "IN"}, {"HL-", "KR"}, {"ZS-", "ZA"},
+  {"A6-", "AE"}, {"HZ-", "SA"}, {"A7-", "QA"}, {"9K-", "KW"}
+};
+
+const char* regCountry(const char* reg) {
+  if (!reg || !reg[0]) return "";
+  const char* iso = "";
+  size_t best = 0;
+  for (size_t i = 0; i < KV_COUNT(REG_PREFIX); i++) {
+    size_t n = strlen(REG_PREFIX[i].p);
+    if (n > best && strncmp(reg, REG_PREFIX[i].p, n) == 0) {
+      best = n;
+      iso = REG_PREFIX[i].iso;
+    }
+  }
+  return iso;
+}
+
+// Zdroj pozicie: type z API ma prednost, fallback su priznaky z mlat/tisb poli
+const char* sourceLabel(const Aircraft& a) {
+  if (a.srcFlags & 1) return "ADS-B";
+  if (a.srcFlags & 2) return "MLAT";
+  if (a.srcFlags & 4) return "TIS-B";
+  if (a.srcFlags & 8) return "ADS-C";
+  if (a.srcFlags & 16) return "OTHER";
+  return "";
 }
 
 // ---------------------------------------------------------------- geometry
@@ -698,7 +931,10 @@ void buildFilter() {
     "hex", "flight", "r", "t", "desc", "lat", "lon", "alt_baro", "alt_geom", "gs",
     "track", "true_heading", "baro_rate", "roll", "mach", "ias", "tas", "nav_modes",
     "nav_altitude_mcp", "nav_heading", "squawk", "emergency", "category", "tat", "oat",
-    "wd", "ws", "rssi", "dbFlags"
+    "wd", "ws", "rssi", "dbFlags",
+    // data quality / source (P1)
+    "type", "seen", "seen_pos", "mlat", "tisb", "nic", "rc", "nac_p", "sil", "sil_type",
+    "version", "nav_qnh", "nav_altitude_fms", "geom_rate", "alert", "spi"
   };
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) objFilter[keys[i]] = true;
 }
@@ -740,6 +976,30 @@ void fillAircraft(JsonObjectConst o, Aircraft& a) {
   a.rssi = o["rssi"] | 0.0f;
   a.dbFlags = o["dbFlags"] | 0;
 
+  // ---- data quality / source of the position (P1)
+  a.seenPos = o["seen_pos"].isNull() ? -1 : (int16_t)ceilf(o["seen_pos"].as<float>());
+  a.nic = o["nic"] | 0;
+  a.rc = o["rc"] | 0;
+  a.nacp = o["nac_p"] | 0;
+  a.sil = o["sil"] | 0;
+  a.adsbVer = o["version"] | 0;
+  a.navQnh = o["nav_qnh"] | 0.0f;
+  a.navAltFms = o["nav_altitude_fms"] | 0;
+  a.geomRate = o["geom_rate"] | 0;
+  const char* src = o["type"] | "";
+  if (strncmp(src, "adsb", 4) == 0) a.srcFlags |= 1;
+  else if (strncmp(src, "mlat", 4) == 0) a.srcFlags |= 2;
+  else if (strncmp(src, "tisb", 4) == 0) a.srcFlags |= 4;
+  else if (strncmp(src, "adsc", 4) == 0) a.srcFlags |= 8;
+  else if (src[0]) a.srcFlags |= 16;
+  // adsb.lol / adsb.fi list the fields derived from MLAT / TIS-B in arrays
+  for (JsonVariantConst v : o["mlat"].as<JsonArrayConst>()) {
+    if (strcmp(v.as<const char*>(), "lat") == 0) { a.srcFlags |= 2; break; }
+  }
+  for (JsonVariantConst v : o["tisb"].as<JsonArrayConst>()) {
+    if (strcmp(v.as<const char*>(), "lat") == 0) { a.srcFlags |= 4; break; }
+  }
+
   if (!o["track"].isNull()) { a.track = o["track"] | 0.0f; a.hasTrack = true; }
   if (!o["true_heading"].isNull()) { a.hdg = o["true_heading"] | 0.0f; a.hasHdg = true; }
   else if (a.hasTrack) { a.hdg = a.track; a.hasHdg = true; }
@@ -753,6 +1013,23 @@ void fillAircraft(JsonObjectConst o, Aircraft& a) {
   }
   nm.trim();
   cpy(a.navModes, sizeof(a.navModes), nm.c_str());
+
+  // ---- derived values (P1): phase of flight and wind components
+  if (a.onGround) a.phase = 0;
+  else if (a.baroRate > 400) a.phase = 2;
+  else if (a.baroRate < -400) {
+    a.phase = (a.altBaro > 0 && a.altBaro < 5000 && a.gs > 40 && a.gs < 220) ? 1 : 4;
+  }
+  else if (a.altBaro > 15000) a.phase = 3;
+  else if (a.altBaro > 0 && a.altBaro < 5000 && a.gs > 0 && a.gs < 200) a.phase = 1;
+  else a.phase = 3;
+  if (a.ws > 0 && a.hasTrack) {
+    float rel = (a.wd - a.track) * DEG_TO_RAD;
+    a.headwind = a.ws * cosf(rel);
+    a.crosswind = a.ws * sinf(rel);
+  }
+
+  a.watched = matchWatch(a);
 
   strcpy(a.dep, "-");
   strcpy(a.arr, "-");
@@ -780,6 +1057,7 @@ void insertBlip() {
   b.gs = tmpA.gs;
   b.hasTrack = tmpA.hasTrack;
   b.level = tmpA.level;
+  b.seenPos = tmpA.seenPos;
   float key = (float)tmpA.distNm;
   if (blipNextCount < MAX_BLIPS) {
     blipNext[blipNextCount] = b;
@@ -800,11 +1078,15 @@ void processObject(const String& obj) {
   scanParsed++;
   fillAircraft(odoc.as<JsonObjectConst>(), tmpA);
   if (!tmpA.hasPos) { scanNoPos++; return; }
+  applyCachedEnrichment(tmpA);
+  // Stale positions (seen_pos > 180 s) drzali na obrazovke duchov; zahodit
+  if (tmpA.seenPos > 180) { scanNoPos++; return; }
   Rel r = relOf(tmpA.lat, tmpA.lon);
   tmpA.distNm = r.dist;
   tmpA.bearing = r.bearing;
   tmpA.level = interestLevel(tmpA);
   statsUpdate(tmpA);
+  if (hideGround && tmpA.onGround) return;   // len na zobrazenie, statistika uz zapocitana
   insertCand();
   insertBlip();
 }
@@ -861,45 +1143,166 @@ bool scanResponse(HTTPClient& http) {
   return false;   // connection ended before the "ac" array was complete
 }
 
-// ---------------------------------------------------------------- alerts / sounds
+// ---------------------------------------------------------------- alerts / sounds (P2)
+// tiche hodiny podla lokalneho casu; bez NTP zvuk neblokujeme
+bool quietNow() {
+  if (quietFrom == quietTo) return false;
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return false;
+  int h = t.tm_hour;
+  if (quietFrom < quietTo) return (h >= quietFrom && h < quietTo);
+  return (h >= quietFrom || h < quietTo);
+}
+
+bool soundAllowed() { return soundOn && !quietNow(); }
+
 void playNewAircraftSound() {
-  if (!soundOn) return;
+  if (!soundAllowed()) return;
   M5.Speaker.tone(1400, 60);
   delay(70);
   M5.Speaker.tone(1800, 90);
 }
 
-void playAlertSound(uint8_t level) {
-  if (!soundOn) return;
-  if (level >= 3) {
-    for (int i = 0; i < 3; i++) { M5.Speaker.tone(2600, 120); delay(170); }
-  } else if (level == 2) {
-    M5.Speaker.tone(900, 120); delay(160);
-    M5.Speaker.tone(1500, 160); delay(200);
-  } else {
-    M5.Speaker.tone(1800, 80); delay(110);
-    M5.Speaker.tone(2200, 80); delay(110);
+// kind: 1 rare, 2 military, 3 emergency, 4 watch, 5 CPA, 6 overhead
+void playAlertSound(uint8_t kind) {
+  if (!soundAllowed()) return;
+  switch (kind) {
+    case 3:
+      for (int i = 0; i < 3; i++) { M5.Speaker.tone(2600, 120); delay(170); }
+      break;
+    case 2:
+      M5.Speaker.tone(900, 120); delay(160);
+      M5.Speaker.tone(1500, 160); delay(200);
+      break;
+    case 4:
+      M5.Speaker.tone(2000, 90); delay(120);
+      M5.Speaker.tone(1700, 90); delay(120);
+      M5.Speaker.tone(2300, 120); delay(150);
+      break;
+    case 5:
+      for (int i = 0; i < 3; i++) { M5.Speaker.tone(2800, 60); delay(90); }
+      break;
+    case 6:
+      M5.Speaker.tone(2200, 150); delay(170);
+      M5.Speaker.tone(1600, 150); delay(170);
+      break;
+    default:
+      M5.Speaker.tone(1800, 80); delay(110);
+      M5.Speaker.tone(2200, 80); delay(110);
+      break;
   }
 }
 
-bool wasAlerted(uint32_t hex32) {
-  for (int i = 0; i < 8; i++) if (alertedHex[i] == hex32) return true;
+uint32_t alertColor(uint8_t kind) {
+  if (kind == 5) return TFT_RED;         // CPA
+  if (kind == 6) return TFT_YELLOW;      // overhead
+  return levelColor(kind);
+}
+
+uint32_t alertTextColor(uint8_t kind) {
+  if (kind == 5) return TFT_WHITE;
+  if (kind == 6) return TFT_BLACK;
+  return levelTextColor(kind);
+}
+
+bool wasAlerted(uint32_t hex, uint8_t kind) {
+  for (size_t i = 0; i < KV_COUNT(alertSeen); i++) {
+    if (alertSeen[i].hex == hex && alertSeen[i].kind == kind && millis() < alertSeen[i].until) return true;
+  }
   return false;
 }
 
-// returns true if a new alert was triggered (and that aircraft was selected)
-bool checkAlerts() {
+void markAlerted(uint32_t hex, uint8_t kind) {
+  alertSeen[alertSeenIdx].hex = hex;
+  alertSeen[alertSeenIdx].kind = kind;
+  alertSeen[alertSeenIdx].until = millis() + ALERT_DEDUPE_MS;
+  alertSeenIdx = (alertSeenIdx + 1) % KV_COUNT(alertSeen);
+}
+
+uint8_t alertPriority(uint8_t kind) {
+  switch (kind) {
+    case 3: return 1;   // emergency
+    case 5: return 2;   // CPA
+    case 6: return 3;   // overhead
+    case 2: return 4;   // military
+    case 4: return 5;   // watch
+    default: return 6;  // rare
+  }
+}
+
+bool alertEnabled(uint8_t kind) {
+  uint16_t bit = 0;
+  switch (kind) {
+    case 3: bit = 1; break;
+    case 2: bit = 2; break;
+    case 1: bit = 4; break;
+    case 4: bit = 8; break;
+    case 5: bit = 16; break;
+    case 6: bit = 32; break;
+  }
+  return (alertFlags & bit) != 0;
+}
+
+// Vyhodnoti vsetky alerty, vyberie najvyšsiu prioritu a nastavi banner.
+bool evaluateAlerts() {
+  int bestIdx = -1;
+  uint8_t bestKind = 0, bestPrio = 255;
+  double bestCpaKm = 0, bestCpaMin = 0, bestElev = 0;
+
   for (int i = 0; i < acCount; i++) {
-    if (ac[i].level > 0 && !wasAlerted(ac[i].hex32)) {
-      alertedHex[alertedIdx] = ac[i].hex32;
-      alertedIdx = (alertedIdx + 1) % 8;
-      sel = i;
-      currentPage = 0;
-      playAlertSound(ac[i].level);
-      return true;
+    Aircraft& a = ac[i];
+    Rel r = relNow(a);
+
+    if (a.level > 0 && alertEnabled(a.level) && !wasAlerted(a.hex32, a.level)) {
+      uint8_t p = alertPriority(a.level);
+      if (p < bestPrio) { bestIdx = i; bestKind = a.level; bestPrio = p; }
+    }
+
+    if (alertEnabled(5) && !wasAlerted(a.hex32, 5) && a.hasTrack && a.gs >= 20) {
+      double cpaNm, tSec;
+      if (computeCpa(a, r, cpaNm, tSec)) {
+        double km = cpaNm * 1.852, mins = tSec / 60.0;
+        if (km <= cpaThresholdKm && mins <= cpaThresholdMin) {
+          uint8_t p = alertPriority(5);
+          if (p < bestPrio) { bestIdx = i; bestKind = 5; bestPrio = p; bestCpaKm = km; bestCpaMin = mins; }
+        }
+      }
+    }
+
+    if (alertEnabled(6) && !wasAlerted(a.hex32, 6) && !a.onGround && a.hasPos) {
+      int altFt = a.altBaro > 0 ? a.altBaro : a.altGeom;
+      if (altFt > 0) {
+        double distM = r.dist * 1852.0;
+        if (distM < 100) distM = 100;
+        double elev = atan2(altFt * 0.3048, distM) * RAD_TO_DEG;
+        if (elev >= overheadElev) {
+          uint8_t p = alertPriority(6);
+          if (p < bestPrio) { bestIdx = i; bestKind = 6; bestPrio = p; bestElev = elev; }
+        }
+      }
     }
   }
-  return false;
+
+  if (bestIdx < 0) return false;
+
+  Aircraft& a = ac[bestIdx];
+  markAlerted(a.hex32, bestKind);
+  sel = bestIdx;
+  currentPage = 0;
+  bannerKind = bestKind;
+  bannerHex = a.hex32;
+  bannerUntil = millis() + BANNER_MS;
+  if (bestKind == 5) {
+    bannerText = "CPA " + fmtDistKm(bestCpaKm) + " / " + String((int)(bestCpaMin * 60)) + "s";
+  } else if (bestKind == 6) {
+    bannerText = "OVERHEAD " + String((int)bestElev) + "deg " + fmtAlt(a.altBaro);
+  } else {
+    bannerText = levelName(bestKind);
+  }
+  playAlertSound(bestKind);
+  Serial.printf("[ALERT] %s %s\n", a.flight[0] ? a.flight : a.hex, bannerText.c_str());
+  displayCurrentPage();
+  return true;
 }
 
 // ---------------------------------------------------------------- flight route
@@ -954,29 +1357,51 @@ bool routeFetchNow(const char* callsign, char* dep, char* arr) {
 // Background task: dotazy bezia mimo hlavnej slucky, vysledok ide cez routeResult.
 void routeTask(void*) {
   for (;;) {
-    if (!routeReqPending) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
-    RouteReq req;
-    taskENTER_CRITICAL(&routeMux);
-    req = routeReq;
-    routeReqPending = false;
-    routeBusy = true;
-    taskEXIT_CRITICAL(&routeMux);
+    if (routeReqPending) {
+      RouteReq req;
+      taskENTER_CRITICAL(&routeMux);
+      req = routeReq;
+      routeReqPending = false;
+      routeBusy = true;
+      taskEXIT_CRITICAL(&routeMux);
 
-    char dep[5] = "-", arr[5] = "-";
-    bool ok;
-    {
-      NetLock lock;
-      ok = routeFetchNow(req.flight, dep, arr);
+      char dep[5] = "-", arr[5] = "-";
+      bool ok;
+      {
+        NetLock lock;
+        ok = routeFetchNow(req.flight, dep, arr);
+      }
+      taskENTER_CRITICAL(&routeMux);
+      routeResult.hex = req.hex;
+      cpy(routeResult.dep, sizeof(routeResult.dep), dep);
+      cpy(routeResult.arr, sizeof(routeResult.arr), arr);
+      routeResult.ok = ok;
+      routeResultReady = true;
+      routeBusy = false;
+      taskEXIT_CRITICAL(&routeMux);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
     }
-    taskENTER_CRITICAL(&routeMux);
-    routeResult.hex = req.hex;
-    cpy(routeResult.dep, sizeof(routeResult.dep), dep);
-    cpy(routeResult.arr, sizeof(routeResult.arr), arr);
-    routeResult.ok = ok;
-    routeResultReady = true;
-    routeBusy = false;
-    taskEXIT_CRITICAL(&routeMux);
-    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (enrichPending) {
+      uint32_t hex = enrichHex;
+      enrichPending = false;
+      char desc[24] = "";
+      bool ok;
+      {
+        NetLock lock;
+        ok = enrichFetchNow(hex, desc);
+      }
+      taskENTER_CRITICAL(&routeMux);
+      enrichResultHex = hex;
+      cpy(enrichResultDesc, sizeof(enrichResultDesc), ok ? desc : "");
+      enrichResultReady = true;
+      taskEXIT_CRITICAL(&routeMux);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -986,6 +1411,15 @@ void requestRoute(int idx) {
   Aircraft& a = ac[idx];
   if (a.routeTried || a.flight[0] == 0) return;
   if (a.routeTries >= ROUTE_MAX_TRIES) { a.routeTried = true; return; }
+  char cdep[5], carr[5];
+  if (routeCacheLookup(a.flight, cdep, carr)) {
+    cpy(a.dep, sizeof(a.dep), cdep);
+    cpy(a.arr, sizeof(a.arr), carr);
+    a.routeTried = true;
+    Serial.printf("[ROUTE] %s from cache %s > %s\n", a.flight, cdep, carr);
+    if (idx == sel) displayCurrentPage();
+    return;
+  }
   if (millis() < routeRetryAt) return;
   if (routeReqPending || routeBusy) return;
 
@@ -1002,6 +1436,7 @@ void requestRoute(int idx) {
       cpy(a.dep, sizeof(a.dep), dep);
       cpy(a.arr, sizeof(a.arr), arr);
       a.routeTried = true;
+      routeCacheStore(a.flight, dep, arr);
       displayCurrentPage();
     } else if (a.routeTries >= ROUTE_MAX_TRIES) {
       a.routeTried = true;
@@ -1034,6 +1469,7 @@ void applyRouteResult() {
       cpy(ac[i].dep, sizeof(ac[i].dep), res.dep);
       cpy(ac[i].arr, sizeof(ac[i].arr), res.arr);
       ac[i].routeTried = true;
+      routeCacheStore(ac[i].flight, res.dep, res.arr);
     } else if (ac[i].routeTries >= ROUTE_MAX_TRIES) {
       ac[i].routeTried = true;
     } else {
@@ -1044,7 +1480,291 @@ void applyRouteResult() {
   }
 }
 
-// ---------------------------------------------------------------- setup / loop
+// ---------------------------------------------------------------- P3: storage, caches, OTA
+uint32_t nowEpoch() {
+  time_t t = time(nullptr);
+  return t > 1700000000 ? (uint32_t)t : 0;   // 0 = clock not synchronised yet
+}
+
+// ---- sightings log (LittleFS CSV; one row per aircraft per 5 minutes)
+bool logBegin() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[LOG] mount failed");
+    logMounted = false;
+    return false;
+  }
+  logMounted = true;
+  File f = LittleFS.open("/log.csv", FILE_READ);
+  logBytes = f ? (uint32_t)f.size() : 0;
+  if (f) f.close();
+  Serial.printf("[LOG] mounted, %u bytes, total %u/%u\n",
+                (unsigned)logBytes, (unsigned)LittleFS.usedBytes(),
+                (unsigned)LittleFS.totalBytes());
+  return true;
+}
+
+bool logSeenRecently(uint32_t hex) {
+  for (size_t i = 0; i < KV_COUNT(logSeen); i++) {
+    if (logSeen[i].hex == hex && millis() < logSeen[i].until) return true;
+  }
+  return false;
+}
+
+void markLogSeen(uint32_t hex) {
+  logSeen[logSeenIdx].hex = hex;
+  logSeen[logSeenIdx].until = millis() + 300000UL;   // 5 minutes
+  logSeenIdx = (logSeenIdx + 1) % KV_COUNT(logSeen);
+}
+
+void logRotateIfNeeded() {
+  if (logBytes <= LOG_ROTATE_BYTES) return;
+  LittleFS.remove("/log.old.csv");
+  LittleFS.rename("/log.csv", "/log.old.csv");
+  logBytes = 0;
+  Serial.println("[LOG] rotated (256 kB)");
+}
+
+void logAircraft(const Aircraft& a) {
+  if (!logEnabled || !logMounted || a.hex32 == 0) return;
+  if (logSeenRecently(a.hex32)) return;
+  struct tm t;
+  if (!getLocalTime(&t, 0)) return;      // without NTP the timestamp would be wrong
+  markLogSeen(a.hex32);
+  logRotateIfNeeded();
+  File f = LittleFS.open("/log.csv", FILE_APPEND);
+  if (!f) {
+    Serial.println("[LOG] open failed");
+    return;
+  }
+  char line[160];
+  int n = snprintf(line, sizeof(line),
+                   "%04d-%02d-%02dT%02d:%02d:%02d,%06x,%s,%s,%s,%d,%.0f,%.1f,%s\n",
+                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+                   (unsigned)a.hex32, a.flight, a.reg, a.type,
+                   a.onGround ? 0 : a.altBaro, a.gs, a.distNm * 1.852, sourceLabel(a));
+  f.write((const uint8_t*)line, n);
+  f.close();
+  logBytes += n;
+  Serial.printf("[LOG] +%d B %06x %s (total %u B)\n", n, (unsigned)a.hex32,
+                a.flight[0] ? a.flight : a.hex, (unsigned)logBytes);
+}
+
+// ---- route cache (callsign -> dep/arr, 7 days)
+bool routeCacheLookup(const char* cs, char* dep, char* arr) {
+  uint32_t now = nowEpoch();
+  if (!now || !cs || !cs[0]) return false;
+  for (int i = 0; i < RCACHE_MAX; i++) {
+    if (rcache[i].expires <= now || !rcache[i].cs[0]) continue;
+    if (strcasecmp(rcache[i].cs, cs) != 0) continue;
+    cpy(dep, 5, rcache[i].dep);
+    cpy(arr, 5, rcache[i].arr);
+    return true;
+  }
+  return false;
+}
+
+void routeCacheStore(const char* cs, const char* dep, const char* arr) {
+  uint32_t now = nowEpoch();
+  if (!now || !cs || !cs[0]) return;
+  int slot = 0;
+  uint32_t oldest = UINT32_MAX;
+  for (int i = 0; i < RCACHE_MAX; i++) {
+    if (!rcache[i].cs[0] || rcache[i].expires <= now) { slot = i; break; }
+    if (rcache[i].expires < oldest) { oldest = rcache[i].expires; slot = i; }
+  }
+  memset(&rcache[slot], 0, sizeof(rcache[slot]));
+  cpy(rcache[slot].cs, sizeof(rcache[slot].cs), cs);
+  cpy(rcache[slot].dep, sizeof(rcache[slot].dep), dep);
+  cpy(rcache[slot].arr, sizeof(rcache[slot].arr), arr);
+  rcache[slot].expires = now + ROUTE_CACHE_TTL;
+  preferences.putBytes("rcache", rcache, sizeof(rcache));
+  Serial.printf("[ROUTE] cached %s %s > %s\n", cs, dep, arr);
+}
+
+// ---- enrichment cache (hex -> long type name, 30 days)
+bool enrichCacheLookup(uint32_t hex, char* desc) {
+  uint32_t now = nowEpoch();
+  if (!now) return false;
+  for (int i = 0; i < ENRICH_MAX; i++) {
+    if (enrichCache[i].hex != hex || !enrichCache[i].desc[0]) continue;
+    if (enrichCache[i].expires <= now) return false;
+    cpy(desc, 24, enrichCache[i].desc);
+    return true;
+  }
+  return false;
+}
+
+void enrichCacheStore(uint32_t hex, const char* desc) {
+  uint32_t now = nowEpoch();
+  if (!now || !desc || !desc[0]) return;
+  int slot = 0;
+  uint32_t oldest = UINT32_MAX;
+  for (int i = 0; i < ENRICH_MAX; i++) {
+    if (!enrichCache[i].hex || enrichCache[i].expires <= now) { slot = i; break; }
+    if (enrichCache[i].expires < oldest) { oldest = enrichCache[i].expires; slot = i; }
+  }
+  memset(&enrichCache[slot], 0, sizeof(enrichCache[slot]));
+  enrichCache[slot].hex = hex;
+  cpy(enrichCache[slot].desc, sizeof(enrichCache[slot].desc), desc);
+  enrichCache[slot].expires = now + ENRICH_CACHE_TTL;
+  preferences.putBytes("ecache", enrichCache, sizeof(enrichCache));
+  Serial.printf("[ENRICH] cached %06x %s\n", (unsigned)hex, desc);
+}
+
+void loadCaches() {
+  size_t n = preferences.getBytesLength("rcache");
+  if (n == sizeof(rcache)) preferences.getBytes("rcache", rcache, n);
+  n = preferences.getBytesLength("ecache");
+  if (n == sizeof(enrichCache)) preferences.getBytes("ecache", enrichCache, n);
+  uint32_t now = nowEpoch();
+  int routes = 0, enriched = 0;
+  for (int i = 0; i < RCACHE_MAX; i++) if (rcache[i].cs[0] && (!now || rcache[i].expires > now)) routes++;
+  for (int i = 0; i < ENRICH_MAX; i++) if (enrichCache[i].hex && (!now || enrichCache[i].expires > now)) enriched++;
+  Serial.printf("[CACHE] loaded %d route(s), %d enrichment(s)\n", routes, enriched);
+}
+
+void applyCachedEnrichment(Aircraft& a) {
+  if (a.desc[0] || !a.hex32) return;
+  char d[24];
+  if (enrichCacheLookup(a.hex32, d)) cpy(a.desc, sizeof(a.desc), d);
+}
+
+void applyEnrichmentResult() {
+  if (!enrichResultReady) return;
+  uint32_t hex;
+  char desc[24];
+  taskENTER_CRITICAL(&routeMux);
+  hex = enrichResultHex;
+  cpy(desc, sizeof(desc), enrichResultDesc);
+  enrichResultReady = false;
+  taskEXIT_CRITICAL(&routeMux);
+  if (!desc[0]) return;
+  enrichCacheStore(hex, desc);
+  for (int i = 0; i < acCount; i++) {
+    if (ac[i].hex32 != hex) continue;
+    if (!ac[i].desc[0]) cpy(ac[i].desc, sizeof(ac[i].desc), desc);
+    if (i == sel) displayCurrentPage();
+    break;
+  }
+}
+
+// Dotaz na /v2/hex; vysledkom je dlhy nazov typu (desc), ktory chyba v lokalnej tabulke
+bool enrichFetchNow(uint32_t hex, char* descOut) {
+  char url[64];
+  snprintf(url, sizeof(url), "https://api.adsb.lol/v2/hex/%06x", (unsigned)hex);
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setUserAgent(userAgent);
+  if (!http.begin(client, url)) {
+    Serial.println("[ENRICH] ERROR: http.begin() failed");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  int httpCode = http.GET();
+  bool ok = false;
+  if (httpCode == HTTP_CODE_OK) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getString());
+    if (!err && doc["ac"].is<JsonArrayConst>() && doc["ac"].size() > 0) {
+      const char* d = doc["ac"][0]["desc"] | "";
+      if (!d[0]) d = doc["ac"][0]["ownOp"] | "";
+      if (d[0]) {
+        cpy(descOut, 24, d);
+        ok = true;
+      }
+    }
+  }
+  http.end();
+  Serial.printf("[ENRICH] %06x HTTP %d, free heap %u\n", (unsigned)hex, httpCode,
+                (unsigned)ESP.getFreeHeap());
+  return ok;
+}
+
+void maybeEnrichSelected() {
+  if (acCount == 0 || enrichPending || routeReqPending || routeBusy) return;
+  if (rateRemaining >= 0 && rateRemaining < 50) return;   // set quota: do not spend it on enrichment
+  Aircraft& a = ac[sel];
+  if (!a.hex32 || a.hex32 == enrichTriedHex) return;
+  if (a.desc[0]) return;                                  // already known from the API / cache
+  if (lookupKV(TYPE_NAMES, KV_COUNT(TYPE_NAMES), a.type)) return;
+  char d[24];
+  if (enrichCacheLookup(a.hex32, d)) return;
+  enrichHex = a.hex32;
+  enrichTriedHex = a.hex32;
+  enrichPending = true;
+}
+
+// ---- OTA (web upload in setup mode; needs two app slots)
+bool otaAvailable() {
+  return esp_ota_get_next_update_partition(nullptr) != nullptr;
+}
+
+void handleLogCsv() {
+  lastActivityTime = millis();
+  if (!logMounted) {
+    server.send(404, "text/plain", "LittleFS is not mounted");
+    return;
+  }
+  File f = LittleFS.open("/log.csv", FILE_READ);
+  if (!f) {
+    server.send(404, "text/plain", "Log is empty");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=log.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleLogClear() {
+  lastActivityTime = millis();
+  if (logMounted) {
+    LittleFS.remove("/log.old.csv");
+    LittleFS.remove("/log.csv");
+    logBytes = 0;
+    Serial.println("[LOG] cleared from the web page");
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
+void handleOtaPage() {
+  lastActivityTime = millis();
+  String html =
+      "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Firmware update</title><style>body{font-family:-apple-system,sans-serif;margin:0;"
+      "background:#f5f5f7;color:#1d1d1f}.c{padding:25px;max-width:520px;margin:30px auto;background:#fff;"
+      "border-radius:12px}button{background:#007aff;color:#fff;padding:14px;border:none;border-radius:8px;"
+      "font-size:16px;font-weight:600;width:100%}a{color:#007aff}</style></head><body><div class='c'>"
+      "<h2>Firmware update</h2><p>Current version: <b>" + String(FW_VERSION) + "</b></p>";
+  if (!otaAvailable()) {
+    html += "<p style='color:#c00'>This partition layout has no second app slot. Flash the "
+            "partitions_8mb_ota.csv layout over USB first.</p>";
+  } else {
+    html += "<form method='POST' action='/update' enctype='multipart/form-data'>"
+            "<p><input type='file' name='firmware' accept='.bin' required></p>"
+            "<button type='submit'>Upload and reboot</button></form>"
+            "<p style='color:#6e6e73;font-size:13px'>Do not disconnect power during the upload.</p>";
+  }
+  html += "<p><a href='/'>&larr; Back to setup</a></p></div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("[OTA] start: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("[OTA] success: %u bytes\n", upload.totalSize);
+    else Update.printError(Serial);
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
   unsigned long serialT0 = millis();
@@ -1062,9 +1782,25 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Power.begin();
+  M5.update();
+  bool forceSetup = M5.BtnA.isPressed();   // hold BtnA at boot: setup AP without a factory reset
   preferences.begin("adsb-config", false);
   soundOn = preferences.getBool("sound", true);
   gpsEnabled = preferences.getBool("gps", true);
+  unitsMode = preferences.getInt("units", 0);
+  hideGround = preferences.getBool("gnd", true);
+  watchList = preferences.getString("watch", "");
+  parseWatchlist();
+  cpaThresholdKm = preferences.getFloat("cpaKm", 2.0f);
+  cpaThresholdMin = preferences.getInt("cpaMin", 2);
+  overheadElev = preferences.getInt("elev", 70);
+  quietFrom = preferences.getInt("qfrom", 22);
+  quietTo = preferences.getInt("qto", 7);
+  alertFlags = preferences.getInt("flags", 0x003F);
+  logEnabled = preferences.getBool("log", true);
+  loadCaches();
+  logBegin();          // mount always: the log can be downloaded/cleared even when logging is off
+  if (!logEnabled) Serial.println("[LOG] logging disabled in settings");
   M5.Power.setExtOutput(gpsEnabled);    // 5V on the Grove port only when GPS is enabled
   if (gpsEnabled) gpsBegin();
   M5.Speaker.setVolume(255);
@@ -1078,9 +1814,11 @@ void setup() {
   routeTaskOk = (xTaskCreatePinnedToCore(routeTask, "route", 16384, nullptr, 1, nullptr, 0) == pdPASS);
   if (!routeTaskOk) Serial.println("[ROUTE] background task failed, blocking fallback active");
   wifi_ssid = preferences.getString("ssid", "");
-  if (wifi_ssid == "") {
+  if (wifi_ssid == "" || forceSetup) {
+    if (forceSetup) Serial.println("[SETUP] BtnA held at boot, starting setup mode");
     configMode = true;
     startConfigMode();
+    if (forceSetup) showToast("Setup mode");
   } else {
     configMode = false;
     loadSettingsAndConnect();
@@ -1136,7 +1874,9 @@ void loop() {
       lastPollTime = millis();
     }
     applyRouteResult();
+    applyEnrichmentResult();
     if (!isResetting) requestRoute(sel);
+    maybeEnrichSelected();
     if (rateLimited && acCount == 0 && !toastActive() && millis() - lastRedraw > 1000) {
       lastRedraw = millis();                           // refresh the retry countdown
       displayCurrentPage();
@@ -1254,7 +1994,7 @@ void showToast(const char* text) {
   M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
   M5.Display.setTextDatum(MC_DATUM);
   M5.Display.drawString(text, 120, 68);
-  toastUntil = millis() + 1500;
+  toastUntil = millis() + 2500;
 }
 
 bool toastActive() { return toastUntil != 0 && millis() < toastUntil; }
@@ -1308,6 +2048,7 @@ void handleButtons() {
     btnCToggled = false;
     btnCStart = millis();
     lastActivityTime = millis();
+    Serial.println("[UI] BtnC down");
   }
   if (btnCDown && !btnCToggled && M5.BtnPWR.isPressed() && millis() - btnCStart >= BTN_C_HOLD_MS) {
     btnCToggled = true;
@@ -1315,15 +2056,25 @@ void handleButtons() {
       soundOn = !soundOn;
       preferences.putBool("sound", soundOn);
       if (soundOn) M5.Speaker.tone(2000, 100);
+      Serial.printf("[UI] sound=%s\n", soundOn ? "on" : "off");
       displayCurrentPage();                       // refresh the mute icon
       showToast(soundOn ? "Sound ON" : "Sound OFF");
     }
   }
   if (M5.BtnPWR.wasReleased() && btnCDown) {
     btnCDown = false;
-    if (!btnCToggled && !configMode && currentPage == PAGE_MAP) {
-      cycleMapScale();
-      displayCurrentPage();
+    Serial.printf("[UI] BtnC up (held %lu ms)\n", millis() - btnCStart);
+    if (!btnCToggled && !configMode) {
+      if (currentPage == PAGE_MAP) {
+        cycleMapScale();
+        displayCurrentPage();
+      } else {
+        unitsMode = !unitsMode;
+        preferences.putInt("units", unitsMode);
+        Serial.printf("[UI] units=%s (BtnC short, page %d)\n", unitsMode ? "NM/FL" : "km/ft", currentPage + 1);
+        displayCurrentPage();
+        showToast(unitsMode ? "Units NM/FL" : "Units km/ft");
+      }
     }
   }
   if (btnADown && !btnALong && M5.BtnA.isPressed() && millis() - btnAStart >= BTN_A_LONG_MS) {
@@ -1415,8 +2166,23 @@ void startConfigMode() {
   dnsServer.start(53, "*", WiFi.softAPIP());
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/log.csv", HTTP_GET, handleLogCsv);
+  server.on("/log/clear", HTTP_POST, handleLogClear);
+  server.on("/update", HTTP_GET, handleOtaPage);
+  server.on("/update", HTTP_POST, []() {
+    bool ok = !Update.hasError();
+    server.send(200, "text/html",
+                ok ? "<h1>Update OK</h1><p>Rebooting...</p>"
+                   : "<h1>Update failed</h1><p>Check the serial log and try again.</p>");
+    if (ok) {
+      delay(500);
+      ESP.restart();
+    }
+  }, handleOtaUpload);
   server.onNotFound(handleNotFound);
   server.begin();
+  Serial.printf("[SETUP] web server ready, log %u kB, OTA %s\n", (unsigned)(logBytes / 1024),
+                otaAvailable() ? "available" : "unavailable (partition layout)");
 }
 
 // Wi-Fi watchdog: reconnect s rastucim odstupom, po 10 min fallback do setup rezimu.
@@ -1561,6 +2327,23 @@ void handleRoot() {
   html.replace("%RADIUS%", curRadius);
   html.replace("%UA%", htmlEscape(curUa));
   html.replace("%GPSCHK%", gpsEnabled ? "checked" : "");
+  html.replace("%LOGCHK%", logEnabled ? "checked" : "");
+  html.replace("%LOGSIZE%", String(logBytes / 1024));
+  html.replace("%GNDCHK%", hideGround ? "checked" : "");
+  html.replace("%SELKM%", unitsMode ? "" : " selected");
+  html.replace("%SELNM%", unitsMode ? " selected" : "");
+  html.replace("%WATCH%", htmlEscape(watchList));
+  html.replace("%CPAKM%", String(cpaThresholdKm, 1));
+  html.replace("%CPAMIN%", String(cpaThresholdMin));
+  html.replace("%ELEV%", String(overheadElev));
+  html.replace("%QFROM%", String(quietFrom));
+  html.replace("%QTO%", String(quietTo));
+  html.replace("%A_EMERG%", (alertFlags & 1) ? "checked" : "");
+  html.replace("%A_MIL%", (alertFlags & 2) ? "checked" : "");
+  html.replace("%A_RARE%", (alertFlags & 4) ? "checked" : "");
+  html.replace("%A_WATCH%", (alertFlags & 8) ? "checked" : "");
+  html.replace("%A_CPA%", (alertFlags & 16) ? "checked" : "");
+  html.replace("%A_OVER%", (alertFlags & 32) ? "checked" : "");
   html.replace("%VER%", FW_VERSION);
   server.send(200, "text/html", html);
 }
@@ -1602,9 +2385,51 @@ void handleSave() {
     server.send(400, "text/html", setupError("Scan radius must be a whole number from 1 to 250 NM."));
     return;
   }
+  String watch = server.arg("watch");
+  watch.replace("\r", " ");
+  watch.replace("\n", " ");
+  watch.trim();
+  if (watch.length() > 120) {
+    server.send(400, "text/html", setupError("Watchlist is too long (max 120 characters)."));
+    return;
+  }
+  double cpaKm = 0, cpaMin = 0, elev = 0, qf = 0, qt = 0;
+  if (!parseNum(server.arg("cpakm"), 0.5, 20.0, cpaKm)) {
+    server.send(400, "text/html", setupError("CPA alarm distance must be 0.5-20 km."));
+    return;
+  }
+  if (!parseNum(server.arg("cpamin"), 1.0, 15.0, cpaMin)) {
+    server.send(400, "text/html", setupError("CPA alarm time window must be 1-15 minutes."));
+    return;
+  }
+  if (!parseNum(server.arg("elev"), 30.0, 89.0, elev)) {
+    server.send(400, "text/html", setupError("Overhead elevation must be 30-89 degrees."));
+    return;
+  }
+  if (!parseNum(server.arg("qfrom"), 0.0, 23.0, qf) || !parseNum(server.arg("qto"), 0.0, 23.0, qt)) {
+    server.send(400, "text/html", setupError("Quiet hours must be whole hours between 0 and 23."));
+    return;
+  }
+  uint16_t flags = 0;
+  if (server.hasArg("a_emerg")) flags |= 1;
+  if (server.hasArg("a_mil")) flags |= 2;
+  if (server.hasArg("a_rare")) flags |= 4;
+  if (server.hasArg("a_watch")) flags |= 8;
+  if (server.hasArg("a_cpa")) flags |= 16;
+  if (server.hasArg("a_over")) flags |= 32;
   int radius = (int)(rad + 0.5);
   preferences.putString("ua", ua);
   preferences.putBool("gps", server.hasArg("gps"));
+  preferences.putBool("log", server.hasArg("log"));
+  preferences.putBool("gnd", server.hasArg("gnd"));
+  preferences.putInt("units", server.arg("units") == "nm" ? 1 : 0);
+  preferences.putString("watch", watch);
+  preferences.putFloat("cpaKm", (float)cpaKm);
+  preferences.putInt("cpaMin", (int)(cpaMin + 0.5));
+  preferences.putInt("elev", (int)(elev + 0.5));
+  preferences.putInt("qfrom", (int)(qf + 0.5));
+  preferences.putInt("qto", (int)(qt + 0.5));
+  preferences.putInt("flags", flags);
   preferences.putString("ssid", ssid);
   preferences.putString("password", pass);
   preferences.putString("lat", String(lat, 6));
@@ -1618,23 +2443,6 @@ void handleSave() {
 void handleNotFound() {
   server.sendHeader("Location", "http://192.168.4.1", true);
   server.send(302, "text/plain", "");
-}
-
-// ---------------------------------------------------------------- page rendering
-void drawFooter(bool aircraftPage) {
-  canvas.setFont(&fonts::Font0);
-  canvas.setTextColor(TFT_DARKGREY);
-  canvas.setTextDatum(BC_DATUM);
-  canvas.drawString(String(currentPage + 1) + "/" + String(NUM_PAGES) + "  " + FW_VERSION, 120, 134);
-  if (aircraftPage && acCount > 0) {
-    canvas.setTextDatum(BR_DATUM);
-    canvas.drawString("AC " + String(sel + 1) + "/" + String(acCount), 236, 134);
-    if (ac[sel].level > 0) {
-      canvas.setTextDatum(BL_DATUM);
-      canvas.setTextColor(levelColor(ac[sel].level));
-      canvas.drawString(levelName(ac[sel].level), 4, 134);
-    }
-  }
 }
 
 // Page 7: arrow, distance, trend, CPA
@@ -1665,15 +2473,16 @@ void drawTrackPage() {
   canvas.fillTriangle(tx, ty, rx, ry, nx, ny, col);
 
   // CPA
-  char cpaLine[24], cpaTime[24];
+  String cpaLine;
+  char cpaTime[24];
   double cpaNm, tSec;
   cpaTime[0] = 0;
   if (!a.hasTrack || a.gs < 20) {
-    strcpy(cpaLine, "CPA ---");
+    cpaLine = "CPA ---";
   } else if (!computeCpa(a, r, cpaNm, tSec)) {
-    strcpy(cpaLine, "PASSED");
+    cpaLine = "PASSED";
   } else {
-    snprintf(cpaLine, sizeof(cpaLine), "CPA %.1f km", cpaNm * 1.852);
+    cpaLine = "CPA " + fmtDistKm(cpaNm * 1.852);
     int s = (int)tSec;
     if (s > 5999) strcpy(cpaTime, "in >99 min");
     else snprintf(cpaTime, sizeof(cpaTime), "in %d:%02d", s / 60, s % 60);
@@ -1686,7 +2495,7 @@ void drawTrackPage() {
   canvas.setTextDatum(TR_DATUM);
   canvas.setTextColor(TFT_WHITE);
   canvas.setFont(&fonts::FreeSansBold12pt7b);
-  canvas.drawString(String(km, 1) + " km", 225, 68);
+  canvas.drawString(fmtDistKm(km), 225, 68);
   canvas.setFont(&fonts::FreeSans9pt7b);
   canvas.setTextColor(col);
   canvas.drawString(trend, 225, 88);
@@ -1709,14 +2518,13 @@ void drawMapPage() {
   canvas.drawFastVLine(cx, cy - 4, 9, TFT_GREEN);
 
   float rangeKm = rangeNm * 1.852f;
-  String rangeStr = String(rangeKm, fabs(rangeKm - roundf(rangeKm)) < 0.05f ? 0 : 1);
   canvas.setFont(&fonts::Font0);
   canvas.setTextColor(TFT_LIGHTGREY);
   canvas.setTextDatum(TC_DATUM);
   canvas.drawString("N", cx, 12);
   canvas.setTextDatum(BL_DATUM);
   canvas.setTextColor(TFT_DARKGREY);
-  canvas.drawString("R " + rangeStr + " km", 4, 134);
+  canvas.drawString("R " + fmtDistKm(rangeKm), 4, 134);
 
   for (int i = 0; i < blipCount; i++) {
     Blip& b = blips[i];
@@ -1727,8 +2535,10 @@ void drawMapPage() {
     int py = cy - (int)(r.dy * scale);
     double dpx = px - cx, dpy = py - cy;
     if (sqrt(dpx * dpx + dpy * dpy) > R + 3) continue;
-    uint32_t col = b.level > 0 ? levelColor(b.level) : (uint32_t)TFT_WHITE;
-    canvas.fillCircle(px, py, 2, col);
+    bool stale = (b.seenPos > 60);
+    uint32_t col = b.level > 0 ? levelColor(b.level)
+                 : stale ? (uint32_t)TFT_DARKGREY : (uint32_t)TFT_WHITE;
+    canvas.fillCircle(px, py, stale ? 1 : 2, col);
     if (b.hasTrack) {
       double t = b.track * DEG_TO_RAD;
       canvas.drawLine(px, py, px + (int)(7 * sin(t)), py - (int)(7 * cos(t)), col);
@@ -1750,7 +2560,7 @@ void drawMapPage() {
       canvas.setFont(&fonts::Font0);
       canvas.setTextColor(TFT_YELLOW);
       canvas.setTextDatum(BR_DATUM);
-      canvas.drawString("SEL " + String(r.dist * 1.852, 1) + " km", 236, 134);
+      canvas.drawString("SEL " + fmtDistKm(r.dist * 1.852), 236, 134);
     }
   }
 }
@@ -1772,13 +2582,15 @@ void drawListPage() {
     else if (known && radial > 10) dcol = TFT_RED;
 
     const char* name = a.flight[0] ? a.flight : (a.reg[0] ? a.reg : a.hex);
-    canvas.setTextColor(a.level > 0 ? levelColor(a.level) : (uint32_t)TFT_WHITE);
+    bool stale = (a.seenPos > 60);
+    canvas.setTextColor(stale ? (uint32_t)TFT_DARKGREY
+                      : a.level > 0 ? levelColor(a.level) : (uint32_t)TFT_WHITE);
     canvas.setTextDatum(TL_DATUM);
     canvas.drawString(name, 8, y + 1);
 
-    canvas.setTextColor(dcol);
+    canvas.setTextColor(stale ? (uint32_t)TFT_DARKGREY : dcol);
     canvas.setTextDatum(TR_DATUM);
-    canvas.drawString(String(r.dist * 1.852, 1) + "km", 160, y + 1);
+    canvas.drawString(fmtDistKm(r.dist * 1.852), 160, y + 1);
 
     String alt;
     if (a.onGround) alt = "GND";
@@ -1799,7 +2611,7 @@ void drawStatsPage() {
   const char* labels[4] = {"Aircraft", "Closest", "Highest", "Fastest"};
   String values[4];
   values[0] = String(stats.count);
-  values[1] = (stats.minKm < 9000) ? String(stats.minKm, 1) + " km " + stats.minFl : String("-");
+  values[1] = (stats.minKm < 9000) ? fmtDistKm(stats.minKm) + " " + stats.minFl : String("-");
   values[2] = (stats.maxAlt > 0) ? "FL" + String(stats.maxAlt / 100) + " " + stats.altFl : String("-");
   values[3] = (stats.maxGs > 0) ? String(stats.maxGs) + " kt " + stats.gsFl : String("-");
 
@@ -1816,15 +2628,67 @@ void drawStatsPage() {
   }
 }
 
+// Page 11: data quality, source of the position and expert fields
+void drawDataPage() {
+  Aircraft& a = ac[sel];
+
+  const char* labels[7] = {"SRC", "CATEGORY", "NIC / RC", "NACp / SIL",
+                           "QNH / FMS", "WIND", "REG / COUNTRY"};
+  String values[7];
+  values[0] = String(sourceLabel(a)) + " " + phaseName(a.phase) + " " +
+              (a.seenPos >= 0 ? String(a.seenPos) + "s" : "---");
+  values[1] = String(a.category[0] ? a.category : "--") + " " + categoryLabel(a.category);
+  values[2] = String(a.nic) + " / " + (a.rc ? String(a.rc) + " m" : "---");
+  values[3] = (a.sil ? String(a.nacp) + " / " + String(a.sil) + " " + (a.adsbVer ? "v" + String(a.adsbVer) : "") : "---");
+  values[4] = String(a.navQnh, 1) + " / " + (a.navAltFms ? fmtAlt(a.navAltFms) : "---");
+  if (a.ws > 0 && a.hasTrack) {
+    values[5] = "H" + String(a.headwind, 0) + " X" + String(a.crosswind, 0) + " kt";
+  } else {
+    values[5] = "---";
+  }
+  const char* iso = regCountry(a.reg);
+  values[6] = String(a.reg[0] ? a.reg : a.hex) + (iso[0] ? String(" ") + iso : "");
+
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  canvas.setTextColor(TFT_CYAN);
+  canvas.setTextDatum(TC_DATUM);
+  canvas.drawString("DATA QUALITY", 120, 4);
+
+  for (int i = 0; i < 7; i++) {
+    int y = 22 + i * 15;
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(TFT_LIGHTGREY);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(labels[i], 6, y);
+    canvas.setTextColor(i == 0 && (!(a.srcFlags & 1) && (a.srcFlags & (2 | 4))) ? (uint32_t)TFT_ORANGE
+                      : (uint32_t)TFT_WHITE);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(values[i], 234, y);
+  }
+}
+
 void displayCurrentPage() {
   canvas.fillScreen(BLACK);
   marqueeActive = false;
 
-  bool aircraftPage = (acCount > 0 && currentPage < PAGE_MAP);
+  bool aircraftPage = (acCount > 0 && (currentPage < PAGE_MAP || currentPage == PAGE_DATA));
+
+  // banner: level alert (emergency/military/watch/rare) or an active CPA/overhead banner
+  uint8_t bKind = 0;
+  String bText;
+  if (aircraftPage) {
+    if (ac[sel].level > 0) {
+      bKind = ac[sel].level;
+      bText = levelName(bKind);
+    } else if (bannerHex == ac[sel].hex32 && millis() < bannerUntil) {
+      bKind = bannerKind;
+      bText = bannerText;
+    }
+  }
   uiFg = TFT_WHITE;
-  if (aircraftPage && ac[sel].level > 0) {
-    canvas.fillRect(0, 0, 240, 40, levelColor(ac[sel].level));   // alert banner
-    uiFg = levelTextColor(ac[sel].level);
+  if (bKind) {
+    canvas.fillRect(0, 0, 240, 40, alertColor(bKind));   // alert banner
+    uiFg = alertTextColor(bKind);
   }
   drawBatteryStatus();
   drawClock();
@@ -1832,7 +2696,6 @@ void displayCurrentPage() {
 
   if (currentPage == PAGE_STATS) {
     drawStatsPage();
-    drawFooter(false);
     canvas.pushSprite(0, 0);
     return;
   }
@@ -1856,6 +2719,12 @@ void displayCurrentPage() {
     return;
   }
 
+  if (currentPage == PAGE_DATA) {
+    drawDataPage();
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
   if (currentPage == PAGE_MAP) {
     drawMapPage();
     canvas.pushSprite(0, 0);
@@ -1864,7 +2733,6 @@ void displayCurrentPage() {
 
   if (currentPage == PAGE_LIST) {
     drawListPage();
-    drawFooter(false);
     canvas.pushSprite(0, 0);
     return;
   }
@@ -1872,14 +2740,19 @@ void displayCurrentPage() {
   Aircraft& a = ac[sel];
   String flight = a.flight[0] ? a.flight : (a.reg[0] ? a.reg : a.hex);
 
-  canvas.setTextColor(a.level > 0 ? levelTextColor(a.level) : (uint32_t)TFT_YELLOW);
+  canvas.setTextColor(bKind ? alertTextColor(bKind) : (uint32_t)TFT_YELLOW);
   canvas.setFont(&fonts::Orbitron_Light_32);
   canvas.setTextDatum(TC_DATUM);
   canvas.drawString(flight, 120, 5);
 
-  // line below the flight number: airline (or registration) | type
+  // line below the flight number: alert text, else airline (or registration) | type
   const char* airline = airlineName(a);
-  String line = String(airline ? airline : (a.reg[0] ? a.reg : "N/A")) + " | " + typeName(a);
+  String line;
+  if (bKind && bText.length()) {
+    line = bText + "  |  " + typeName(a);
+  } else {
+    line = String(airline ? airline : (a.reg[0] ? a.reg : "N/A")) + " | " + typeName(a);
+  }
   canvas.setTextColor(TFT_WHITE);
   canvas.setFont(&fonts::FreeSans9pt7b);
   int lw = canvas.textWidth(line);
@@ -1906,12 +2779,12 @@ void displayCurrentPage() {
     case 0: {
       canvas.setFont(&fonts::FreeSans9pt7b);
       canvas.setTextDatum(TL_DATUM);
-      canvas.drawString("ALT", 15, 75);
+      canvas.drawString(unitsMode ? "ALT (FL)" : "ALT (ft)", 15, 75);
       canvas.drawString("GND SPD", 15, 95);
       canvas.drawString("ROUTE", 15, 115);
       canvas.setFont(&fonts::FreeSansBold12pt7b);
       canvas.setTextDatum(TR_DATUM);
-      canvas.drawString(a.onGround ? String("GND") : String(a.altBaro) + " ft", 225, 75);
+      canvas.drawString(a.onGround ? String("GND") : fmtAlt(a.altBaro), 225, 75);
       canvas.drawString(String(a.gs, 0) + " kt", 225, 95);
       canvas.drawString(String(a.dep) + " > " + String(a.arr), 225, 115);
       break;
@@ -1936,23 +2809,23 @@ void displayCurrentPage() {
       canvas.setTextDatum(TL_DATUM);
       canvas.drawString("MACH", 15, 75);
       canvas.drawString("IAS/TAS", 15, 95);
-      canvas.drawString("GEOM ALT", 15, 115);
+      canvas.drawString(unitsMode ? "GEOM ALT (FL)" : "GEOM ALT (ft)", 15, 115);
       canvas.setFont(&fonts::FreeSansBold12pt7b);
       canvas.setTextDatum(TR_DATUM);
       canvas.drawString(String(a.mach, 3), 225, 75);
       canvas.drawString(String(a.ias) + "/" + String(a.tas) + "kt", 225, 95);
-      canvas.drawString(String(a.altGeom) + " ft", 225, 115);
+      canvas.drawString(fmtAlt(a.altGeom), 225, 115);
       break;
     }
     case 3: {
       canvas.setFont(&fonts::FreeSans9pt7b);
       canvas.setTextDatum(TL_DATUM);
-      canvas.drawString("AP ALT", 15, 75);
+      canvas.drawString(unitsMode ? "AP ALT (FL)" : "AP ALT (ft)", 15, 75);
       canvas.drawString("AP HDG", 15, 95);
       canvas.drawString("AP MODE", 15, 115);
       canvas.setFont(&fonts::FreeSansBold12pt7b);
       canvas.setTextDatum(TR_DATUM);
-      canvas.drawString(String(a.navAlt) + " ft", 225, 75);
+      canvas.drawString(fmtAlt(a.navAlt), 225, 75);
       canvas.drawString(String(a.navHdg, 0), 218, 95);
       drawDegreeSymbol(222, 95 + 3);
       canvas.setFont(&fonts::FreeSansBold9pt7b);
@@ -1969,7 +2842,8 @@ void displayCurrentPage() {
       canvas.setTextDatum(TR_DATUM);
       canvas.drawString(a.squawk, 225, 75);
       canvas.drawString(a.hex[0] ? a.hex : "N/A", 225, 95);
-      canvas.drawString(a.reg[0] ? a.reg : "N/A", 225, 115);
+      const char* iso = regCountry(a.reg);
+      canvas.drawString(String(a.reg[0] ? a.reg : "N/A") + (iso[0] ? String(" ") + iso : ""), 225, 115);
       break;
     }
     case 5: {
@@ -2010,7 +2884,6 @@ void displayCurrentPage() {
       break;
     }
   }
-  drawFooter(true);
   canvas.pushSprite(0, 0);
 }
 
@@ -2050,6 +2923,7 @@ void commitScan() {
   for (int i = 0; i < acCount; i++) {
     if (ac[i].hex32 == selHex) { sel = i; break; }
   }
+  for (int i = 0; i < acCount; i++) logAircraft(ac[i]);
 }
 
 // Wait time after an HTTP 429: exponential (20, 40, 80, 120 s), Retry-After wins if present
@@ -2116,12 +2990,30 @@ void fetchAircraftData() {
       return;
     }
     http.addHeader("Accept", "application/json");
-    const char* hdrKeys[] = {"Transfer-Encoding", "Retry-After"};
-    http.collectHeaders(hdrKeys, 2);
+    const char* hdrKeys[] = {"Transfer-Encoding", "Retry-After",
+                             "x-ratelimit-remaining", "x-ratelimit-reset"};
+    http.collectHeaders(hdrKeys, 4);
 
     int httpCode = http.GET();
     Serial.printf("[AIRCRAFT] HTTP status: %d, free heap: %u\n", httpCode,
                   (unsigned int)ESP.getFreeHeap());
+
+    // adaptive quota: switch to the fallback before the primary runs out (500 requests/day)
+    if (http.hasHeader("x-ratelimit-remaining")) {
+      rateRemaining = http.header("x-ratelimit-remaining").toInt();
+      rateReset = http.header("x-ratelimit-reset").toInt();
+      Serial.printf("[RATE] remaining=%d, reset in %ld s\n", rateRemaining, rateReset);
+      if (usePrimary && rateRemaining < 20) {
+        unsigned long block = rateReset > 0 ? (unsigned long)rateReset * 1000UL : 3600000UL;
+        if (block > 6UL * 3600UL * 1000UL) block = 6UL * 3600UL * 1000UL;
+        primaryBlockedUntil = millis() + block;
+        Serial.printf("[RATE] quota low, primary blocked for %lu s\n", block / 1000);
+      }
+      if (rateRemaining < 5 && pollInterval < 60000) {
+        pollInterval = 60000;
+        Serial.println("[RATE] quota almost exhausted, polling slowed to 60 s");
+      }
+    }
 
     if (httpCode == 429) {
       consecutive429++;
@@ -2188,7 +3080,7 @@ void fetchAircraftData() {
 
         if (acCount > 0) {
           lastActivityTime = millis();
-          bool alert = checkAlerts();
+          bool alert = evaluateAlerts();
           if (!alert && ac[0].hex32 != lastNearestHex) playNewAircraftSound();
           lastNearestHex = ac[0].hex32;
           displayCurrentPage();        // show first, route is fetched in the background
