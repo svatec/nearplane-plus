@@ -45,7 +45,7 @@ DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
 // Firmware version, shown in the footer, in the setup page and in the serial banner
-const char* FW_VERSION = "v4.2";
+const char* FW_VERSION = "v4.3";
 
 // Default User-Agent, used only when none is saved in the setup form.
 // adsb.lol requires a User-Agent with real contact info (e-mail or URL).
@@ -354,7 +354,10 @@ bool btnCDown = false, btnCToggled = false;
 unsigned long btnCStart = 0;
 const unsigned long BTN_C_HOLD_MS = 750;   // hold BtnC this long to toggle the buzzer
 unsigned long toastUntil = 0;        // on-screen message visible until this time
-int mapScaleIdx = 0;                 // 0 = full configured radius, 1..3 = 25 / 12.5 / 7.5 km
+// radar map scale as a fraction of the configured radius (100 / 50 / 25 %)
+const float MAP_SCALE_PCT[] = {1.0f, 0.5f, 0.25f};
+const int MAP_SCALE_STEPS = sizeof(MAP_SCALE_PCT) / sizeof(MAP_SCALE_PCT[0]);
+int mapScaleIdx = 0;                 // 0 = 100 %, 1 = 50 %, 2 = 25 % of the configured radius
 bool btnADown = false, btnALong = false;
 unsigned long btnAStart = 0;
 const unsigned long BTN_A_LONG_MS = 600;
@@ -1999,18 +2002,14 @@ void showToast(const char* text) {
 
 bool toastActive() { return toastUntil != 0 && millis() < toastUntil; }
 
-// map radius in NM for the given scale step
+// map radius in NM for the given scale step (fraction of the configured radius)
 float scaleNm(int i) {
-  if (i == 1) return 25.0f / 1.852f;
-  if (i == 2) return 12.5f / 1.852f;
-  if (i == 3) return 7.5f / 1.852f;
-  return radiusNm;
+  if (i < 0 || i >= MAP_SCALE_STEPS) i = 0;
+  return radiusNm * MAP_SCALE_PCT[i];
 }
 
 void cycleMapScale() {
-  mapScaleIdx = (mapScaleIdx + 1) % 4;
-  // skip steps that are not smaller than the configured radius
-  while (mapScaleIdx > 0 && scaleNm(mapScaleIdx) >= radiusNm) mapScaleIdx = (mapScaleIdx + 1) % 4;
+  mapScaleIdx = (mapScaleIdx + 1) % MAP_SCALE_STEPS;
 }
 
 bool inMapRange(const Aircraft& a) {
@@ -2524,7 +2523,8 @@ void drawMapPage() {
   canvas.drawString("N", cx, 12);
   canvas.setTextDatum(BL_DATUM);
   canvas.setTextColor(TFT_DARKGREY);
-  canvas.drawString("R " + fmtDistKm(rangeKm), 4, 134);
+  int rangePct = (int)(MAP_SCALE_PCT[mapScaleIdx] * 100.0f + 0.5f);
+  canvas.drawString("R " + String(rangePct) + "% " + fmtDistKm(rangeKm), 4, 134);
 
   for (int i = 0; i < blipCount; i++) {
     Blip& b = blips[i];

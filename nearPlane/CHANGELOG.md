@@ -1,6 +1,6 @@
 # nearPlane+ – Changelog & Controls / Zmeny a ovládanie
 
-nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.2)
+nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.3)
 
 **Language / Jazyk:** [English](#english) · [Slovenčina](#slovenčina)
 
@@ -58,7 +58,7 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.2)
 - Up to 40 aircraft as dots with a short heading line; positions move every second.
 - Colour follows alert level; selected aircraft is circled in yellow.
 - If the selected aircraft is outside the current scale, a yellow dot is shown on the rim in its direction and `SEL 24.1 km` in the footer.
-- **Scale cycle:** full configured radius → 25 km → 12.5 km → 7.5 km → repeat (inner ring is always half). Steps larger than the configured radius are skipped.
+- **Scale cycle:** 100 % → 50 % → 25 % of the configured scan radius → repeat (inner ring is always half of the outer). With the default 50 NM radius this is 50 → 25 → 12.5 NM. The map label shows the percentage and the absolute range (e.g. `R 50% 25.0 NM`).
 
 ### 2.6 Nearby list (page 9)
 - 5 closest aircraft with callsign, distance (green = approaching, red = receding) and altitude (`FL360`, `3200ft`, `GND`).
@@ -286,6 +286,12 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - New NVS keys: `log`, `rcache`, `ecache`.
 - New serial prefixes: `[LOG]`, `[CACHE]`, `[ENRICH]`, `[RATE]`, `[OTA]`, `[SETUP]`.
 
+## 11. v4.3 – radar map scale
+
+- The radar map scale is now relative to the configured scan radius instead of fixed 25 / 12.5 / 7.5 km steps: **100 % → 50 % → 25 %**.
+- With the default 50 NM radius the steps are 50 → 25 → 12.5 NM; the map label shows percentage and absolute range (e.g. `R 50% 25.0 NM`).
+- Fixed the unit mismatch: the setup radius is in NM, while the old scale steps were hardcoded in km.
+
 ---
 
 <a id="slovenčina"></a>
@@ -340,7 +346,7 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - Až 40 lietadiel ako bodky s krátkou čiarou smeru; polohy sa hýbu každú sekundu.
 - Farba podľa úrovne alertu; vybrané lietadlo je obkrúžené žltou.
 - Ak je vybrané lietadlo mimo aktuálnej mierky, na okraji kružnice je žltý bod v jeho smere a v pätičke `SEL 24.1 km`.
-- **Cyklus mierky:** celý nastavený rádius → 25 km → 12,5 km → 7,5 km → odznova (vnútorná kružnica je vždy polovica). Kroky väčšie ako nastavený rádius sa preskočia.
+- **Cyklus mierky:** 100 % → 50 % → 25 % z nastaveného rádiusu skenovania → odznova (vnútorná kružnica je vždy polovica vonkajšej). Pri predvolenom rádiuse 50 NM to je 50 → 25 → 12,5 NM. Popis na mape zobrazuje percento aj absolútny dosah (napr. `R 50% 25.0 NM`).
 
 ### 2.6 Zoznam blízkych lietadiel (stránka 9)
 - 5 najbližších lietadiel s volacím znakom, vzdialenosťou (zelená = približuje sa, červená = vzďaľuje) a výškou (`FL360`, `3200ft`, `GND`).
@@ -567,3 +573,9 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 - Batch `routeset` requesty sa **neimplementovali**: mapovanie odpovede sa nedalo overiť, preto opakovanie requestov rieši cache.
 - Nové NVS kľúče: `log`, `rcache`, `ecache`.
 - Nové serial prefixy: `[LOG]`, `[CACHE]`, `[ENRICH]`, `[RATE]`, `[OTA]`, `[SETUP]`.
+
+## 11. v4.3 – mierka radaru
+
+- Mierka radaru je teraz relatívna k nastavenému rádiusu skenovania namiesto pevných krokov 25 / 12,5 / 7,5 km: **100 % → 50 % → 25 %**.
+- Pri predvolenom rádiuse 50 NM sú kroky 50 → 25 → 12,5 NM; popis na mape zobrazuje percento aj absolútny dosah (napr. `R 50% 25.0 NM`).
+- Opravený nesúlad jednotiek: setupový rádius je v NM, staré kroky mierky boli napevno v km.

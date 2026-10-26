@@ -3,7 +3,7 @@
 ![nearPlane+ screen tour](m5_screens.gif)
 
 [![firmware](https://github.com/svatec/nearplane-plus/actions/workflows/build.yml/badge.svg)](https://github.com/svatec/nearplane-plus/actions/workflows/build.yml)
-<br>**Firmware v4.1** · build checked on every push
+<br>**Firmware v4.3** · build checked on every push
 
 **nearPlane+** turns an `M5StickC Plus 2` that is dying in your stuff drawer (I know you have one, everybody does, no worries) into a portable, real-time aircraft tracker. No need to check Flightradar or anything else. It is perfect for aviation enthusiasts, curious minds, and anyone who has ever looked up at the sky and wondered, "What plane is that?"
 
@@ -23,7 +23,7 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 - **Data quality page** – source of the position (ADS-B / MLAT / TIS-B), position age, NIC/RC, NACp/SIL, ADS-B version, emitter category and registration country. Stale targets (>60 s) are dimmed and disappear after 180 s.
 - **Unit switch** – `BtnC` short press toggles km/ft ↔ NM/FL on every page except the map (where it changes the scale). Only distance and altitude fields change: page 1/3/4 altitude (`35000 ft` ↔ `FL350`), pages 7/9/10 distance, page 11 QNH/FMS. Pages 2, 5 and 6 contain no distance or altitude, and speed/wind stay in knots.
 - **Flight route information** – departure and arrival airports (IATA codes) for most commercial flights, fetched once per selected aircraft.
-- **Radar map** – north-up top-down view with up to 40 aircraft, range rings and four scale steps.
+- **Radar map** – north-up top-down view with up to 40 aircraft, range rings and three percentage-based scale steps.
 - **Direction and distance** – arrow to the aircraft, distance in km, bearing, approach/recede trend and closest point of approach (CPA).
 - **Type and airline names** – ICAO type codes (`B738` → `Boeing 737-800`) and callsign prefixes (`RYR1234` → `Ryanair`), with a marquee for long header lines.
 - **Daily statistics** – number of aircraft, closest, highest and fastest aircraft of the day, persisted across reboots.
@@ -234,7 +234,7 @@ Notes:
 stateDiagram-v2
     [*] --> Idle
     Idle --> Pressed: BtnC down
-    Pressed --> Idle: release before 0.75 s → map: change scale; other pages: toggle units
+    Pressed --> Idle: release before 0.75 s → map: cycle scale 100 / 50 / 25 %; other pages: toggle units
     Pressed --> Toggled: held 0.75 s
     Toggled --> Idle: release (buzzer toggled, saved)
 ```
@@ -285,7 +285,7 @@ flowchart LR
     P1 -->|BtnA| P2 -->|BtnA| P3 -->|BtnA| P4 -->|BtnA| P5 -->|BtnA| P6 -->|BtnA| P7
     P7 -->|BtnA| P8 -->|BtnA| P9 -->|BtnA| P10 -->|BtnA| P11 -->|BtnA| P1
     P8 -. "BtnA long press (0.6 s)" .-> P1
-    P8 -. "BtnC: scale 100% / 25 / 12.5 / 7.5 km" .-> P8
+    P8 -. "BtnC: scale 100 / 50 / 25 % of radius" .-> P8
 
     classDef aircraft fill:#1f3a5f,stroke:#4a90d9,color:#fff;
     classDef overview fill:#2d4a2d,stroke:#6abf69,color:#fff;
@@ -299,14 +299,14 @@ An **alert** (emergency, military, watchlist, rare aircraft, close pass or overh
 
 ### Radar map scale
 
-`BtnC` cycles the map radius; the inner ring is always half of the outer one.
+`BtnC` cycles the map radius relative to the scan radius from the setup form; the inner ring is always half of the outer one.
 
 ```mermaid
 flowchart LR
-    S0["Full radius<br/>(from setup)"] -->|BtnC| S1["25 km"] -->|BtnC| S2["12.5 km"] -->|BtnC| S3["7.5 km"] -->|BtnC| S0
+    S0["100 %<br/>(full setup radius, e.g. 50 NM)"] -->|BtnC| S1["50 %<br/>(e.g. 25 NM)"] -->|BtnC| S2["25 %<br/>(e.g. 12.5 NM)"] -->|BtnC| S0
 ```
 
-Steps not smaller than the configured radius are skipped. If the selected aircraft is outside the current scale, it is shown as a yellow dot on the rim and its distance is drawn on the map (e.g. `SEL 24.1 km`).
+With the default 50 NM radius the steps are 50 NM → 25 NM → 12.5 NM. The map label shows the percentage and the absolute range (e.g. `R 50% 25.0 NM`). If the selected aircraft is outside the current scale, it is shown as a yellow dot on the rim and its distance is drawn on the map (e.g. `SEL 24.1 km`).
 
 ### Alerts
 
@@ -437,7 +437,7 @@ The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md
 - Tracks the 5 closest aircraft and switches between them with `BtnB`.
 - Direction page with dead reckoning, approach/recede trend, bearing and CPA.
 - Emergency, military and rare aircraft alerts with coloured banners, sounds and automatic selection.
-- Radar map with up to 40 aircraft and four scale steps.
+- Radar map with up to 40 aircraft and three percentage-based scale steps.
 - Daily statistics stored in NVS: aircraft count, closest, highest and fastest aircraft.
 - Human-readable aircraft types and airline names, with a scrolling header line.
 - Buzzer mute via `BtnC`, battery/charging indicator and clock in the header.
