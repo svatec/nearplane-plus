@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: PlatformIO release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO and pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          asset="nearPlane-plus-${GITHUB_REF_NAME}-m5stickc-plus2-ota.bin"
+          cp .pio/build/m5stickc-plus2/firmware.bin "$asset"
+          sha256sum "$asset" > SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: nearPlane+ ${{ github.ref_name }}
+          body: |
+            Community build for the **M5StickC Plus 2** with 8 MB flash and the OTA partition layout (`partitions_8mb_ota.csv`).
+
+            **OTA update:** hold `BtnA` while powering on, connect to `nearPlane-ADSB-Tracker-Setup`, open `http://192.168.4.1/update`, and upload `nearPlane-plus-${{ github.ref_name }}-m5stickc-plus2-ota.bin`. Verify the SHA-256 checksum from `SHA256SUMS` before flashing.
+
+            The first USB flash still requires the source build (Arduino IDE or PlatformIO); this release is the OTA application image only.
+
+            The image is unsigned. Flash at your own risk.
+          files: |
+            nearPlane-plus-${{ github.ref_name }}-m5stickc-plus2-ota.bin
+            SHA256SUMS
+          fail_on_unmatched_files: true

@@ -68,7 +68,7 @@ The value is stored in flash under the NVS key `ua` and is used for adsb.lol, th
 
 ## Install
 
-The upstream project is available in **M5Burner** as "nearPlane". This fork contains additional features, so build it from source using the guide below.
+The upstream project is available in **M5Burner** as "nearPlane". This fork contains additional features, so build it from source using the guide below, or use a prebuilt OTA release if your device already runs the 8 MB OTA layout.
 
 ### Prerequisites
 
@@ -133,7 +133,18 @@ pio run -t upload      # flash over USB
 pio device monitor     # serial monitor, 115200 baud
 ```
 
-The project uses a custom 8 MB partition table (`partitions_8mb_ota.csv`): two 3 MB application slots for OTA updates and a ~1.9 MB LittleFS partition for the sightings log. With the 4 MB default table the firmware does not fit. **Flashing this layout the first time requires USB** (`pio run -t upload`, or the Arduino IDE with an equivalent OTA partition scheme); after that, updates can be uploaded over the setup access point. GitHub Actions runs the same build on every push and pull request (`.github/workflows/build.yml`).
+The project uses a custom 8 MB partition table (`partitions_8mb_ota.csv`): two 3 MB application slots for OTA updates and a ~1.9 MB LittleFS partition for the sightings log. With the 4 MB default table the firmware does not fit. **Flashing this layout the first time requires USB** (`pio run -t upload`, or the Arduino IDE with an equivalent OTA partition scheme); after that, updates can be uploaded over the setup access point. GitHub Actions runs the same build on every push and pull request (`.github/workflows/build.yml`); tags matching `v*` are built and published by `.github/workflows/release.yml`.
+
+### Prebuilt firmware (GitHub Releases)
+
+Tagged releases contain a CI-built OTA image (`nearPlane-plus-<version>-m5stickc-plus2-ota.bin`) and `SHA256SUMS` from [GitHub Releases](https://github.com/svatec/nearplane-plus/releases). The release workflow builds the exact tagged commit with the same pinned PlatformIO environment.
+
+1. Enter setup mode: hold `BtnA` while powering the device on.
+2. Connect to `nearPlane-ADSB-Tracker-Setup` and open `http://192.168.4.1/update`.
+3. Upload the release `.bin` and wait for the reboot.
+4. Optionally verify the checksum (`sha256sum` on Linux, `shasum -a 256` on macOS) against `SHA256SUMS`.
+
+The release image is an **OTA application image for the M5StickC Plus 2 with the 8 MB OTA layout** (`partitions_8mb_ota.csv`). The first USB flash still requires the source build or a factory image; releases do not replace that step. Builds are unsigned, so flash at your own risk.
 
 ### Device configuration
 
@@ -429,11 +440,11 @@ Route lookups are cached for 7 days per callsign (`rcache` in NVS), enrichment r
 
 ## Changelog
 
-The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md`](nearPlane/CHANGELOG.md).
+The detailed bilingual changelog (English/Slovak) with controls and release notes is in [`nearPlane/CHANGELOG.md`](nearPlane/CHANGELOG.md).
 
 ### This fork
 
-- Ten pages instead of six, including radar map, nearby list and daily statistics.
+- Eleven pages instead of six, including radar map, nearby list, daily statistics and data quality.
 - Tracks the 5 closest aircraft and switches between them with `BtnB`.
 - Direction page with dead reckoning, approach/recede trend, bearing and CPA.
 - Emergency, military and rare aircraft alerts with coloured banners, sounds and automatic selection.
@@ -447,6 +458,9 @@ The detailed bilingual changelog (English/Slovak) is in [`nearPlane/CHANGELOG.md
 - Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, live position and prefilled setup form.
 - **v4.1 – robustness:** Wi-Fi auto-reconnect with backoff and fallback to the setup AP, setup-mode idle timeout, route lookup moved to a background task (UI and buttons no longer freeze) with up to 3 retries, server-side validation of the setup form, prefilled setup fields, automatic daylight saving via `TZ_INFO`, firmware version in the setup page and serial banner.
 - **v4.1 – build:** `platformio.ini` with pinned library versions, GitHub Actions compile check, build artifacts and `.DS_Store` removed from git.
+- **v4.2 – data quality:** page 11 shows the position source and age, NIC/RC, NACp/SIL, ADS-B version, emitter category and registration country.
+- **v4.2 – alerts and storage:** watchlist rules, CPA and overhead alarms, quiet hours, a LittleFS sightings log, route/enrichment caches, quota-aware fallback and OTA updates.
+- **v4.3 – radar scale:** map steps are **100 / 50 / 25 %** of the configured scan radius; the default 50 NM radius gives 50 → 25 → 12.5 NM.
 
 ### Upstream history
 
