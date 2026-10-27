@@ -1,6 +1,6 @@
 # nearPlane+ – Changelog & Controls / Zmeny a ovládanie
 
-nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.5)
+nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.6)
 
 **Language / Jazyk:** [English](#english) · [Slovenčina](#slovenčina)
 
@@ -102,8 +102,8 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.5)
 ### 2.13 Military statistics (page 11, `MIL TODAY`)
 - Daily table of military aircraft (`dbFlags` bit 0) grouped by ICAO type and registration country.
 - One row per type + country with the number of unique aircraft (ICAO hex) seen that day; ground aircraft are included.
-- No headers or summary: 4 records per page in the same font as the TODAY page; `BtnC` short press cycles the list.
-- Unknown type and missing registration country are left blank; `BtnB` has no effect on this page.
+- No headers on the type pages: 4 records per page in the same font as the TODAY page; `BtnC` short press cycles the summary and the type pages.
+- An unknown type is shown as `Unknown`, a missing registration country is left blank; `BtnB` has no effect on this page.
 - Stored in NVS under `mil` every 10 minutes and before sleep; resets at midnight; requires NTP.
 
 ### 2.14 Power profiles and diagnostics
@@ -114,6 +114,13 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.5)
 - Optional `/power.csv` log (10 s battery current) with download/clear in setup; `[POWER]` serial lines.
 - The main loop yields 10 ms instead of busy-spinning; unused IMU and microphone are disabled.
 - New NVS keys: `profile`, `plog`, `gpsfix`, `glat`, `glon`.
+
+### 2.15 Military summary and full type names (v4.6)
+- The first `MIL TODAY` screen is a summary: `TOTAL MILITARY` plus daily unique counts for `Fighters`, `Transport`, `Rotary` and `UAV`, derived from the type table without changing the NVS format.
+- `BtnC` cycles the summary and the existing type pages; the summary uses page 0, so the type pages stay 4 records each.
+- Type rows show full names from `MIL_TYPES` (e.g. `A169` → `Agusta AW-169`, `K35R` → `Boeing KC-135R Stratotanker`) instead of the raw ICAO code; the same names are used on the aircraft detail page.
+- The country code is hidden only when the name does not fit; a name that still overflows scrolls with the same marquee as the home screen (40 px/s, 1.5 s pause).
+- Military types that are not in the category table are counted in `TOTAL MILITARY` but not in the four categories.
 
 ## 3. Controls
 
@@ -143,7 +150,7 @@ BtnC is the third button of the M5StickC Plus2 (the power button, exposed as `M5
 | 8 | Radar map |
 | 9 | Nearby list |
 | 10 | Daily statistics |
-| 11 | Military statistics |
+| 11 | Military statistics and summary |
 | 12 | Data quality |
 
 ## 5. Polling intervals
@@ -424,8 +431,8 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 ### 2.13 Vojenská štatistika (stránka 11, `MIL TODAY`)
 - Denná tabuľka vojenských lietadiel (`dbFlags` bit 0) zoskupená podľa ICAO typu a krajiny registrácie.
 - Jeden riadok na typ + krajinu s počtom unikátnych lietadiel (ICAO hex) za deň; lietadlá na zemi sa počítajú tiež.
-- Bez hlavičiek a súhrnu: 4 záznamy na stránku rovnakým písmom ako stránka TODAY; `BtnC` krátko listuje zoznam.
-- Neznámy typ aj chýbajúca krajina registrácie zostanú prázdne; `BtnB` na tejto stránke nič nerobí.
+- Bez hlavičiek na stránkach typov: 4 záznamy na stránku rovnakým písmom ako stránka TODAY; `BtnC` krátko listuje súhrn a stránky typov.
+- Neznámy typ sa zobrazí ako `Unknown`, chýbajúca krajina registrácie zostane prázdna; `BtnB` na tejto stránke nič nerobí.
 - Ukladá sa do NVS pod kľúčom `mil` každých 10 minút a pred uspatím; o polnoci sa vynuluje; vyžaduje NTP.
 
 ### 2.14 Power profily a diagnostika
@@ -436,6 +443,13 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - Voliteľný `/power.csv` log (10 s batériový prúd) s download/clear v setup; `[POWER]` sériové riadky.
 - Hlavná slučka má 10 ms yield namiesto busy-spin; nepoužívané IMU a mikrofón sú vypnuté.
 - Nové NVS kľúče: `profile`, `plog`, `gpsfix`, `glat`, `glon`.
+
+### 2.15 Vojenský súhrn a plné názvy typov (v4.6)
+- Prvá obrazovka `MIL TODAY` je súhrn: `TOTAL MILITARY` a denné unikátne počty pre `Fighters`, `Transport`, `Rotary` a `UAV`; počítajú sa z tabuľky typov, NVS formát sa nemení.
+- `BtnC` cykluje súhrn a existujúce stránky typov; súhrn je stránka 0, stránky typov zostávajú po 4 záznamoch.
+- Riadky typov zobrazujú plné názvy z `MIL_TYPES` (napr. `A169` → `Agusta AW-169`, `K35R` → `Boeing KC-135R Stratotanker`) namiesto surového ICAO kódu; rovnaké názvy sa používajú aj na detailovej stránke lietadla.
+- Kód krajiny sa skryje len vtedy, keď sa názov nezmestí; ak pretečie aj tak, názov scrolluje rovnakým marquee ako domovská obrazovka (40 px/s, pauza 1,5 s).
+- Vojenské typy, ktoré nie sú v tabuľke kategórií, sa započítajú do `TOTAL MILITARY`, ale nie do štyroch kategórií.
 
 ## 3. Ovládanie
 
@@ -465,7 +479,7 @@ BtnC je tretie tlačidlo M5StickC Plus2 (vypínacie tlačidlo, v knižnici `M5.B
 | 8 | Radar mapa |
 | 9 | Zoznam blízkych lietadiel |
 | 10 | Denná štatistika |
-| 11 | Vojenská štatistika |
+| 11 | Vojenská štatistika a súhrn |
 | 12 | Kvalita dát |
 
 ## 5. Intervaly volania API

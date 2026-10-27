@@ -45,7 +45,7 @@ DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
 // Firmware version, shown in the footer, in the setup page and in the serial banner
-const char* FW_VERSION = "v4.5";
+const char* FW_VERSION = "v4.6";
 
 // Default User-Agent, used only when none is saved in the setup form.
 // adsb.lol requires a User-Agent with real contact info (e-mail or URL).
@@ -303,6 +303,7 @@ int scanObjs = 0, scanParsed = 0, scanNoPos = 0;
 String scanLastErr = "";
 uint32_t uiFg = TFT_WHITE;           // battery/clock colour (changes on alert banners)
 bool marqueeActive = false;          // long "airline | type" line is scrolling
+bool milMarqueeActive = false;       // long type name on MIL TODAY is scrolling
 unsigned long lastMarquee = 0;
 String api_url_alt;                  // fallback server (same JSON format)
 unsigned long primaryBlockedUntil = 0;   // primary server rate-limited until this time
@@ -472,6 +473,100 @@ const char* RARE_TYPES[] = {
   "A388","B744","B748","B74S","A124","A225","BLCF","A3ST","A337","C5M","IL76","A346"
 };
 
+// Vojenske typy: citatelny nazov a kategoria pre suhrn MIL TODAY.
+enum MilCategory : uint8_t {
+  MILCAT_FIGHTER = 0,
+  MILCAT_TRANSPORT,
+  MILCAT_ROTARY,
+  MILCAT_UAV,
+  MILCAT_COUNT
+};
+
+struct MilTypeInfo { const char* code; const char* name; uint8_t cat; };
+
+const MilTypeInfo MIL_TYPES[] = {
+  // stihacky
+  {"A10",   "Fairchild A-10 Thunderbolt II", MILCAT_FIGHTER},
+  {"AV8B",  "McDonnell Douglas AV-8B Harrier II", MILCAT_FIGHTER},
+  {"EUFI",  "Eurofighter Typhoon", MILCAT_FIGHTER},
+  {"F117",  "Lockheed F-117 Nighthawk", MILCAT_FIGHTER},
+  {"F15",   "Boeing F-15 Eagle", MILCAT_FIGHTER},
+  {"F16",   "Lockheed Martin F-16 Fighting Falcon", MILCAT_FIGHTER},
+  {"F18",   "Boeing F/A-18 Hornet", MILCAT_FIGHTER},
+  {"F22",   "Lockheed Martin F-22 Raptor", MILCAT_FIGHTER},
+  {"F35",   "Lockheed Martin F-35 Lightning II", MILCAT_FIGHTER},
+  {"JAS39", "Saab JAS 39 Gripen", MILCAT_FIGHTER},
+  {"M2000", "Dassault Mirage 2000", MILCAT_FIGHTER},
+  {"MIG29", "Mikoyan MiG-29 Fulcrum", MILCAT_FIGHTER},
+  {"MIG31", "Mikoyan MiG-31 Foxhound", MILCAT_FIGHTER},
+  {"MIR2",  "Dassault Mirage 2000", MILCAT_FIGHTER},
+  {"RFAL",  "Dassault Rafale", MILCAT_FIGHTER},
+  {"SU27",  "Sukhoi Su-27 Flanker", MILCAT_FIGHTER},
+  {"SU30",  "Sukhoi Su-30 Flanker", MILCAT_FIGHTER},
+  {"SU34",  "Sukhoi Su-34 Fullback", MILCAT_FIGHTER},
+  {"SU35",  "Sukhoi Su-35 Flanker", MILCAT_FIGHTER},
+  {"TORN",  "Panavia Tornado", MILCAT_FIGHTER},
+  // doprava, tankery, AEW a patracne lietadla
+  {"A124",  "Antonov An-124 Ruslan", MILCAT_TRANSPORT},
+  {"A400",  "Airbus A400M Atlas", MILCAT_TRANSPORT},
+  {"AN12",  "Antonov An-12", MILCAT_TRANSPORT},
+  {"AN26",  "Antonov An-26", MILCAT_TRANSPORT},
+  {"B703",  "Boeing 707", MILCAT_TRANSPORT},
+  {"C2",    "Grumman C-2 Greyhound", MILCAT_TRANSPORT},
+  {"C5",    "Lockheed C-5 Galaxy", MILCAT_TRANSPORT},
+  {"C5M",   "Lockheed C-5M Super Galaxy", MILCAT_TRANSPORT},
+  {"C12",   "Beech C-12 Huron", MILCAT_TRANSPORT},
+  {"C17",   "Boeing C-17 Globemaster III", MILCAT_TRANSPORT},
+  {"C40",   "Boeing C-40 Clipper", MILCAT_TRANSPORT},
+  {"C130",  "Lockheed C-130 Hercules", MILCAT_TRANSPORT},
+  {"C160",  "Transall C-160", MILCAT_TRANSPORT},
+  {"C27J",  "Leonardo C-27J Spartan", MILCAT_TRANSPORT},
+  {"C295",  "Airbus C295", MILCAT_TRANSPORT},
+  {"C30J",  "Lockheed C-130J Hercules", MILCAT_TRANSPORT},
+  {"E2",    "Northrop E-2 Hawkeye", MILCAT_TRANSPORT},
+  {"E3TF",  "Boeing E-3 Sentry", MILCAT_TRANSPORT},
+  {"E6",    "Boeing E-6 Mercury", MILCAT_TRANSPORT},
+  {"IL76",  "Ilyushin Il-76", MILCAT_TRANSPORT},
+  {"K35R",  "Boeing KC-135R Stratotanker", MILCAT_TRANSPORT},
+  {"K35E",  "Boeing KC-135E Stratotanker", MILCAT_TRANSPORT},
+  {"KC10",  "McDonnell Douglas KC-10 Extender", MILCAT_TRANSPORT},
+  {"KC46",  "Boeing KC-46A Pegasus", MILCAT_TRANSPORT},
+  {"L410",  "Let L-410 Turbolet", MILCAT_TRANSPORT},
+  {"P3",    "Lockheed P-3 Orion", MILCAT_TRANSPORT},
+  {"P8",    "Boeing P-8 Poseidon", MILCAT_TRANSPORT},
+  {"V22",   "Bell-Boeing V-22 Osprey", MILCAT_TRANSPORT},
+  // vrtulniky
+  {"A139",  "Agusta AW139", MILCAT_ROTARY},
+  {"A169",  "Agusta AW-169", MILCAT_ROTARY},
+  {"A189",  "Agusta AW189", MILCAT_ROTARY},
+  {"AS65",  "Airbus AS365 Dauphin", MILCAT_ROTARY},
+  {"AW101", "AgustaWestland AW101", MILCAT_ROTARY},
+  {"B06",   "Bell 206", MILCAT_ROTARY},
+  {"B407",  "Bell 407", MILCAT_ROTARY},
+  {"B412",  "Bell 412", MILCAT_ROTARY},
+  {"EC25",  "Airbus H225 Super Puma", MILCAT_ROTARY},
+  {"EC35",  "Airbus H135", MILCAT_ROTARY},
+  {"EC45",  "Airbus H145", MILCAT_ROTARY},
+  {"H47",   "Boeing CH-47 Chinook", MILCAT_ROTARY},
+  {"H53",   "Sikorsky CH-53 Sea Stallion", MILCAT_ROTARY},
+  {"H60",   "Sikorsky UH-60 Black Hawk", MILCAT_ROTARY},
+  {"H64",   "Boeing AH-64 Apache", MILCAT_ROTARY},
+  {"NH90",  "NHIndustries NH90", MILCAT_ROTARY},
+  {"R44",   "Robinson R44", MILCAT_ROTARY},
+  {"R66",   "Robinson R66", MILCAT_ROTARY},
+  {"S76",   "Sikorsky S-76", MILCAT_ROTARY},
+  {"S92",   "Sikorsky S-92", MILCAT_ROTARY},
+  {"UH1",   "Bell UH-1 Huey", MILCAT_ROTARY},
+  // bezposadkove
+  {"MQ1",   "General Atomics MQ-1 Predator", MILCAT_UAV},
+  {"MQ4",   "Northrop MQ-4C Triton", MILCAT_UAV},
+  {"MQ9",   "General Atomics MQ-9 Reaper", MILCAT_UAV},
+  {"RQ2",   "AAI RQ-2 Pioneer", MILCAT_UAV},
+  {"RQ4",   "Northrop RQ-4 Global Hawk", MILCAT_UAV},
+  {"RQ7",   "AAI RQ-7 Shadow", MILCAT_UAV},
+  {"TB2",   "Bayraktar TB2", MILCAT_UAV}
+};
+
 #define KV_COUNT(x) (sizeof(x) / sizeof(x[0]))
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -551,8 +646,28 @@ const char* lookupKV(const KV* tbl, size_t n, const char* key) {
   return nullptr;
 }
 
+const MilTypeInfo* milTypeInfo(const char* code) {
+  if (!code || !code[0]) return nullptr;
+  for (size_t i = 0; i < sizeof(MIL_TYPES) / sizeof(MIL_TYPES[0]); i++) {
+    if (strcmp(MIL_TYPES[i].code, code) == 0) return &MIL_TYPES[i];
+  }
+  return nullptr;
+}
+
+// Plny nazov vojenskeho typu alebo nullptr, ak typ nie je v tabulke.
+const char* milTypeName(const char* code) {
+  const MilTypeInfo* ti = milTypeInfo(code);
+  return ti ? ti->name : nullptr;
+}
+
+int milTypeCategory(const char* code) {
+  const MilTypeInfo* ti = milTypeInfo(code);
+  return ti ? (int)ti->cat : -1;
+}
+
 const char* typeName(const Aircraft& a) {
-  const char* n = lookupKV(TYPE_NAMES, KV_COUNT(TYPE_NAMES), a.type);
+  const char* n = milTypeName(a.type);
+  if (!n) n = lookupKV(TYPE_NAMES, KV_COUNT(TYPE_NAMES), a.type);
   if (n) return n;
   if (a.desc[0]) return a.desc;
   return a.type[0] ? a.type : "N/A";
@@ -1030,7 +1145,17 @@ void statsBeginScan() {
 }
 
 uint8_t milPageCount() {
-  return mil.typeCount ? (mil.typeCount + MIL_ROWS - 1) / MIL_ROWS : 1;
+  uint8_t listPages = mil.typeCount ? (mil.typeCount + MIL_ROWS - 1) / MIL_ROWS : 0;
+  return 1 + listPages;   // page 0 = suhrn kategorii
+}
+
+// Suhrn kategorii sa pocita z tabulky typov, NVS schema ostava nezmenena.
+void milCategoryCounts(uint16_t out[MILCAT_COUNT]) {
+  for (int i = 0; i < MILCAT_COUNT; i++) out[i] = 0;
+  for (int i = 0; i < mil.typeCount; i++) {
+    int c = milTypeCategory(mil.types[i].type);
+    if (c >= 0) out[c] += mil.types[i].count;
+  }
 }
 
 // Vojenske lietadlo = dbFlags bit 0, rovnaka definicia ako pri MILITARY alerte.
@@ -2146,7 +2271,8 @@ void loop() {
       displayCurrentPage();
     }
     // Long airline/type name: smooth scrolling (about 15 frames/s)
-    if (!toastActive() && marqueeActive && acCount > 0 && currentPage < PAGE_MAP && millis() - lastMarquee > 60) {
+    if (!toastActive() && (marqueeActive || milMarqueeActive) &&
+        (acCount > 0 || currentPage == PAGE_MILSTATS) && millis() - lastMarquee > 60) {
       lastMarquee = millis();
       lastRedraw = millis();
       displayCurrentPage();
@@ -2929,22 +3055,103 @@ bool milTypeBefore(const MilTypeStat& a, const MilTypeStat& b) {
   return strcmp(a.cc, b.cc) < 0;
 }
 
-void drawMilStatsPage() {
-  uint8_t pages = milPageCount();
-  if (milPage >= pages) milPage = pages - 1;
+void drawMilSummary() {
+  uint16_t counts[MILCAT_COUNT];
+  milCategoryCounts(counts);
 
   canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextColor(TFT_ORANGE);
   canvas.setTextDatum(TC_DATUM);
   canvas.drawString("MIL TODAY", 120, 5);
 
-  if (mil.typeCount == 0) {
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.drawString("TOTAL MILITARY", 10, 26);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString(String((unsigned int)mil.total), 232, 26);
+
+  const char* labels[MILCAT_COUNT] = {"Fighters", "Transport", "Rotary", "UAV"};
+  for (int i = 0; i < MILCAT_COUNT; i++) {
+    int y = 48 + i * 21;
     canvas.setFont(&fonts::FreeSans9pt7b);
     canvas.setTextColor(TFT_LIGHTGREY);
-    canvas.setTextDatum(MC_DATUM);
-    canvas.drawString("No military today", 120, 70);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(labels[i], 14, y);
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(String((unsigned int)counts[i]), 232, y);
+  }
+}
+
+// Jeden riadok zoznamu: plny nazov, krajina (ak sa zmesti) a pocet.
+// Pri preteceni sa krajina skryje a nazov sa rozscrolluje ako na domovskej stranke.
+void drawMilTypeRow(const MilTypeStat& e, int y) {
+  const char* name = milTypeName(e.type);
+  if (!name) name = e.type[0] ? e.type : "Unknown";
+
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  String cnt = String((unsigned int)e.count);
+  int countW = canvas.textWidth(cnt);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString(cnt, 232, y);
+
+  canvas.setFont(&fonts::FreeSans9pt7b);
+  const int nameX = 10;
+  const int nameRight = 232 - countW - 8;
+  int nameW = canvas.textWidth(name);
+  int ccW = e.cc[0] ? canvas.textWidth(e.cc) + 8 : 0;
+  int avail = nameRight - nameX;
+
+  if (nameW <= avail - ccW) {
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(name, nameX, y);
+    if (e.cc[0]) {
+      canvas.setTextColor(TFT_LIGHTGREY);
+      canvas.setTextDatum(TR_DATUM);
+      canvas.drawString(e.cc, nameRight, y);
+    }
     return;
   }
+
+  if (nameW <= avail) {
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(name, nameX, y);
+    return;
+  }
+
+  // rovnaka rychlost a pauza ako domovska obrazovka (40 px/s, 1,5 s)
+  milMarqueeActive = true;
+  const int gap = 40;
+  int period = nameW + gap;
+  unsigned long cycle = (unsigned long)period * 25UL + 1500UL;
+  unsigned long ph = millis() % cycle;
+  int off = (ph < 1500UL) ? 0 : (int)((ph - 1500UL) / 25UL);
+  canvas.setClipRect(6, y, nameRight - 6, 21);
+  canvas.setTextColor(TFT_WHITE);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.drawString(name, nameX - off, y);
+  canvas.drawString(name, nameX - off + period, y);
+  canvas.clearClipRect();
+}
+
+void drawMilStatsPage() {
+  uint8_t pages = milPageCount();
+  if (milPage >= pages) milPage = 0;
+
+  if (milPage == 0) {
+    drawMilSummary();
+    return;
+  }
+
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  canvas.setTextColor(TFT_ORANGE);
+  canvas.setTextDatum(TC_DATUM);
+  canvas.drawString("MIL TODAY", 120, 5);
 
   uint8_t order[MIL_TYPE_MAX];
   for (int i = 0; i < mil.typeCount; i++) order[i] = i;
@@ -2958,28 +3165,11 @@ void drawMilStatsPage() {
     order[j + 1] = v;
   }
 
-  int start = milPage * MIL_ROWS;
+  int start = (milPage - 1) * MIL_ROWS;
   for (int r = 0; r < MIL_ROWS; r++) {
     int idx = start + r;
     if (idx >= mil.typeCount) break;
-    const MilTypeStat& e = mil.types[order[idx]];
-    int y = 28 + r * 26;
-
-    canvas.setFont(&fonts::FreeSans9pt7b);
-    canvas.setTextColor(TFT_WHITE);
-    canvas.setTextDatum(TL_DATUM);
-    canvas.drawString(e.type, 10, y);
-
-    if (e.cc[0]) {
-      canvas.setTextColor(TFT_LIGHTGREY);
-      canvas.setTextDatum(TR_DATUM);
-      canvas.drawString(e.cc, 195, y);
-    }
-
-    canvas.setFont(&fonts::FreeSansBold9pt7b);
-    canvas.setTextColor(TFT_WHITE);
-    canvas.setTextDatum(TR_DATUM);
-    canvas.drawString(String((unsigned int)e.count), 232, y);
+    drawMilTypeRow(mil.types[order[idx]], 28 + r * 26);
   }
 }
 
@@ -3025,6 +3215,7 @@ void drawDataPage() {
 void displayCurrentPage() {
   canvas.fillScreen(BLACK);
   marqueeActive = false;
+  milMarqueeActive = false;
 
   bool aircraftPage = (acCount > 0 && (currentPage < PAGE_MAP || currentPage == PAGE_DATA));
 

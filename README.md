@@ -314,7 +314,7 @@ flowchart LR
     P8["8 Radar map<br/>north-up, scalable"]
     P9["9 Nearby list<br/>5 closest aircraft"]
     P10["10 Statistics<br/>today's records"]
-    P11["11 MIL TODAY<br/>4 types + count"]
+    P11["11 MIL TODAY<br/>totals + 4 types"]
     P12["12 Data quality<br/>SRC / NIC / NACp"]
 
     P1 -->|BtnA| P2 -->|BtnA| P3 -->|BtnA| P4 -->|BtnA| P5 -->|BtnA| P6 -->|BtnA| P7
@@ -491,6 +491,7 @@ The detailed bilingual changelog (English/Slovak) with controls and release note
 - **v4.3 – radar scale:** map steps are **100 / 50 / 25 %** of the configured scan radius; the default 50 NM radius gives 50 → 25 → 12.5 NM.
 - **v4.4 – military statistics:** page 11 (`MIL TODAY`) lists military aircraft by type and registration country with daily unique counts, 4 records per page and `BtnC` paging; stored in NVS and reset at midnight.
 - **v4.5 – power:** Normal/Balanced/Eco profiles, 70 % brightness with auto-dim, boot-only GPS with NVS fix reuse, Wi-Fi TX power control, loop yield, no deep sleep while charging and optional `/power.csv` battery diagnostics.
+- **v4.6 – military summary:** page 11 opens with the total military count and four category counts (fighters, transport, rotary, UAV); the type list uses full names (e.g. `A169` → `Agusta AW-169`) with the country code and a marquee for long names, while `BtnC` cycles the summary and the type pages.
 
 ### Upstream history
 
