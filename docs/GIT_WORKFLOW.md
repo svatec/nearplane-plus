@@ -79,8 +79,11 @@ Pre prácu, ktorá ešte nie je otestovaná na hardvéri, použi **draft PR** (`
 ## Merge a release
 
 ```bash
-# merge cez GitHub (Squash and merge) a zmazanie vetvy
-# alebo: gh pr merge --squash --delete-branch
+# až po hardvérovom teste: draft -> ready
+gh pr ready 1
+
+# squash merge + zmazanie vetvy
+gh pr merge 1 --squash --delete-branch
 
 git switch main
 git pull --ff-only
@@ -114,10 +117,50 @@ Release je OTA application image. Prvý USB flash stále vyžaduje source build 
 
 - `.github/workflows/build.yml` beží na každý push a PR – PlatformIO build.
 - `.github/workflows/release.yml` beží na tag `v*` – build + GitHub Release.
-- V GitHub Settings → Branches nastav pre `main`:
-  - require pull request before merging,
-  - require status check `PlatformIO build`,
-  - disallow force pushes.
+- PR vytváranie je v tomto repe obmedzené na collaboratorov.
+
+### Aktívny ruleset
+
+- Názov: **`main protection`**
+- ID: **`25986610`**
+- Enforcement: **active**
+- Target: **branch**, pattern **`refs/heads/main`**
+- Bypass actors: **žiadni** – pravidlá platia aj pre admina.
+
+Pravidlá:
+
+- **Require a pull request before merging**, required approvals **0**.
+- **Required status check** `PlatformIO build`, **strict** (branch musí byť up to date).
+- **Block force pushes** (`non_fast_forward`).
+- **Restrict deletions**.
+- Povolené merge metódy v rulesete: merge / squash / rebase; repo nastavenie vypína merge commit, takže efektívne zostáva **squash a rebase**. Používaj **Squash and merge**.
+
+Overenie:
+
+```bash
+gh api repos/svatec/nearplane-plus/rulesets/25986610 \
+  --jq '{name,enforcement,conditions,rules,bypass_actors}'
+```
+
+### Atribúcia commitov
+
+Ruleset má `require_extra_approval_for_unattributed_changes: true`. Commit s e-mailom, ktorý nie je priradený k GitHub účtu, môže vyžadovať extra approval. Aktuálne commity používajú `svatec@m-210.local`.
+
+Ak by merge blokoval review:
+
+1. Nastav GitHub-attributed e-mail:
+   ```bash
+   git config user.name "svatec"
+   git config user.email "244508071+svatec@users.noreply.github.com"
+   ```
+2. Prepíš commity na vetve:
+   ```bash
+   git rebase --exec 'git commit --amend --no-edit --reset-author' main
+   git push --force-with-lease origin feature/v4.5-power
+   ```
+3. Alebo v rulesete vypni `require_extra_approval_for_unattributed_changes`.
+
+Force push je zakázaný len na `main`; na feature vetve je povolený.
 
 ## Commit štýl
 
