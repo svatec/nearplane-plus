@@ -19,14 +19,15 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 
 - **Real-time tracking** – the closest aircraft's data is updated every few seconds, with dead reckoning between API polls.
 - **Multiple aircraft** – the 5 closest aircraft are tracked; `BtnB` selects the next one.
-- **Eleven-page interface** – flight data, attitude, speeds, autopilot, identity, environment, direction/CPA, radar map, nearby list, daily statistics and data quality.
+- **Twelve-page interface** – flight data, attitude, speeds, autopilot, identity, environment, direction/CPA, radar map, nearby list, daily statistics, military statistics and data quality.
 - **Data quality page** – source of the position (ADS-B / MLAT / TIS-B), position age, NIC/RC, NACp/SIL, ADS-B version, emitter category and registration country. Stale targets (>60 s) are dimmed and disappear after 180 s.
-- **Unit switch** – `BtnC` short press toggles km/ft ↔ NM/FL on every page except the map (where it changes the scale). Only distance and altitude fields change: page 1/3/4 altitude (`35000 ft` ↔ `FL350`), pages 7/9/10 distance, page 11 QNH/FMS. Pages 2, 5 and 6 contain no distance or altitude, and speed/wind stay in knots.
+- **Unit switch** – `BtnC` short press toggles km/ft ↔ NM/FL on every page except the map (where it changes the scale). Only distance and altitude fields change: page 1/3/4 altitude (`35000 ft` ↔ `FL350`), pages 7/9/10 distance, page 12 QNH/FMS. Pages 2, 5, 6 and 11 contain no distance or altitude, and speed/wind stay in knots.
 - **Flight route information** – departure and arrival airports (IATA codes) for most commercial flights, fetched once per selected aircraft.
 - **Radar map** – north-up top-down view with up to 40 aircraft, range rings and three percentage-based scale steps.
 - **Direction and distance** – arrow to the aircraft, distance in km, bearing, approach/recede trend and closest point of approach (CPA).
 - **Type and airline names** – ICAO type codes (`B738` → `Boeing 737-800`) and callsign prefixes (`RYR1234` → `Ryanair`), with a marquee for long header lines.
 - **Daily statistics** – number of aircraft, closest, highest and fastest aircraft of the day, persisted across reboots.
+- **Military statistics** – daily table of military aircraft grouped by type and registration country, with unique-aircraft counts, 4 records per page, `BtnC` paging, NVS persistence and a midnight reset.
 - **Sightings log** – a CSV log on LittleFS with download and clear buttons on the setup page.
 - **OTA updates** – upload a new `.bin` over the setup access point, no USB needed after the first flash.
 - **Rate-limit aware** – reads `x-ratelimit-remaining` and switches to the fallback source before the daily quota runs out.
@@ -39,12 +40,15 @@ The tracker normally fetches data from **adsb.lol**, a free, open-source, commun
 - **Quiet hours** – no sounds between 22:00 and 07:00 (configurable); alerts stay visible.
 - **Audible alerts** – a tone plays when a new aircraft is detected; alerts have their own sounds.
 - **Buzzer on/off** – hold `BtnC` for 0.75 seconds (750 ms) to mute or unmute all sounds; the setting is saved.
-- **Live GPS position (optional)** – with an M5Stack GPS Unit v1.1 on the Grove port the tracker uses your current position instead of fixed coordinates; the setup form prefills them from the GPS. See [GPS module](#gps-module-optional).
+- **Boot-time GPS fix (optional)** – with an M5Stack GPS Unit v1.1 on the Grove port the tracker takes one position fix at cold boot, saves it to flash and switches the module off; the saved position is reused after deep-sleep wakes. See [GPS module](#gps-module-optional).
 - **Battery and charging indicator** – battery level with colour coding and a charging icon in the header.
+- **Power profiles** – Normal / Balanced / Eco control poll interval, brightness, Wi-Fi TX power and idle sleep; Balanced is the default.
+- **Auto-dim** – Balanced and Eco dim the backlight after 60 / 30 seconds without a button; any button restores it.
+- **Power diagnostics** – optional 10-second battery-current CSV (`/power.csv`) with download/clear in setup, plus `[POWER]` serial lines.
 - **Clock in the header** – synchronised over NTP with automatic CET/CEST daylight saving (change `TZ_INFO` in the sketch for another zone).
 - **Easy web-based configuration** – an access-point setup mode for Wi-Fi, location (prefilled from the GPS when available), scan radius, the User-Agent contact and the GPS switch.
 - **Factory reset** – hold `BtnB` for 5 seconds to clear all settings and return to setup mode.
-- **Automatic deep sleep** – after 5 minutes without aircraft or button activity the device sleeps for 60 seconds and restarts.
+- **Automatic deep sleep** – after 2 minutes without aircraft or button activity the device sleeps for 5 minutes in Balanced (profiles vary); it never sleeps while charging.
 - **Self-healing connection** – lost Wi-Fi is reconnected automatically (backoff 5–60 s); after 10 minutes without a connection the device returns to setup mode. The setup access point switches itself off after 10 minutes of inactivity (unless charging), so it cannot drain the battery.
 
 ## Requirements
@@ -159,6 +163,7 @@ After a successful flash, the device boots into **SETUP MODE** for the first tim
    - **Your Longitude** – e.g. `28.97000`. Prefilled when a GPS module has a fix.
    - **Scan Radius (NM, max 250)** – the radius around your location, in nautical miles (e.g. `50`; 1 NM = 1.852 km). Prefilled with the stored value.
    - **Units** – km/ft (default) or NM/FL. Can also be switched with `BtnC` outside the map.
+   - **Power profile** – Normal (15 s poll, 100 % brightness), Balanced (30 s, 70 %) or Eco (60 s, 50 %). Also controls Wi-Fi TX power, auto-dim and idle sleep.
    - **Hide aircraft on the ground** – enabled by default; ground targets are left out of the list and the map.
    - **User-Agent** – your e-mail or URL; the value is stored in flash and used for adsb.lol, adsb.fi and route requests. Prefilled when already set.
    - **Watchlist** – comma separated patterns: `OK-*` (registration prefix), `SP-*`, `@DLH` (callsign prefix), `A388` (type), `4CA123` (hex). Up to 10 rules.
@@ -167,7 +172,8 @@ After a successful flash, the device boots into **SETUP MODE** for the first tim
    - **Quiet hours** – from/to in whole hours (default 22–07); set both to the same value to disable.
    - **Alarm toggles** – emergency, military, rare, watchlist, CPA and overhead can be switched off individually.
    - **Log sightings to flash** – writes a CSV row per aircraft per 5 minutes to LittleFS (enabled by default).
-   - **Use GPS module if connected** – checkbox, enabled by default; untick it to always use the coordinates above.
+   - **Log power samples to flash** – optional 10-second battery-current CSV for measurements (off by default).
+   - **Use GPS module (fix only at boot)** – enabled by default; the device takes one fix at cold boot and then powers the module off. Untick it to always use the coordinates above.
 4. Click **Save & Reboot**.
 
 Values are validated on the device: the SSID must have 1–32 characters, latitude must be between -90 and 90, longitude between -180 and 180 and the radius a whole number from 1 to 250. A rejected value shows an error page instead of silently storing garbage.
@@ -176,7 +182,7 @@ The device saves the settings, restarts, connects to your Wi-Fi and starts track
 
 The setup access point switches itself off after 10 minutes of inactivity (it stays on while charging). The form is prefilled from flash, so reconfiguring does not require retyping the SSID, radius or User-Agent.
 
-The page also offers **Download log**, **Clear log** and **Firmware update**. Hold `BtnA` while powering the device on to enter setup mode without a factory reset.
+The page also offers **Download log**, **Clear log**, **Download power log**, **Clear power log** and **Firmware update**. Hold `BtnA` while powering the device on to enter setup mode without a factory reset.
 
 ### Sightings log
 
@@ -196,26 +202,42 @@ time,hex,callsign,reg,type,alt_ft,gs_kt,dist_km,source
 
 The custom partition table has two 3 MB application slots, so a new `.bin` can be uploaded from the setup page (`/update`) without USB. Hold `BtnA` at power-on, connect to `nearPlane-ADSB-Tracker-Setup`, open `http://192.168.4.1/update` and upload the `firmware.bin` built by PlatformIO or exported from the Arduino IDE. The device validates the image, reboots into it and keeps the previous slot as a rollback target. OTA is not available if the device runs a partition layout without a second app slot.
 
-If a GPS module is connected, the setup page says whether it has a fix. Without a fix it asks you to reload the page later (values you typed are lost on reload), or you can simply enter the coordinates by hand.
+If a GPS module is connected, the setup page shows the last saved fix and prefills the coordinates. Without a saved fix, enter them by hand; a new fix is attempted at the next cold boot.
 
 ### GPS module (optional)
 
-With an M5Stack GPS Unit v1.1 (AT6668 + MAX2659, NMEA 0183, 115200 baud) plugged into the Grove port, the device uses the **live GPS position** instead of the coordinates saved in setup.
+With an M5Stack GPS Unit v1.1 (AT6668 + MAX2659, NMEA 0183, 115200 baud) plugged into the Grove port, the tracker takes **one position fix at cold boot**, stores it in NVS and switches the Grove 5 V output off. The saved fix is reused after deep-sleep wakes and normal reboots; the module is not kept running.
 
 | Aspect | Behaviour |
 |---|---|
 | Wiring | Grove port (G32 / G33). Wire orientation and baud rate (115200 or 9600) are **detected automatically**; no setting is needed |
-| Detection | Runs in the background after boot (about 6 s per round, 5 rounds). A module plugged in later needs a reboot; a module unplugged while running is searched for again |
-| Position used | The GPS position while a fix exists (a fix up to 10 minutes old is kept); otherwise the position saved in setup. The API query, distances, bearings and the radar map follow the current position |
-| Indicator | Top right, below the clock: **GPS** = live fix, **GPS?** = module found, waiting for a fix. Nothing is shown when no module is detected |
-| Setup form | Latitude and longitude are prefilled from the GPS; the checkbox **Use GPS module if connected** turns the feature off |
+| Detection | Cold boot only: up to ~13 s for module detection and a 60 s total window for a fix. The 5 V output is cut immediately after the fix or timeout |
+| Position used | The persisted boot fix (also after deep-sleep wakes) until the next cold boot with GPS; otherwise the position saved in setup. The API query, distances, bearings and the radar map follow the current position |
+| Indicator | Top right, below the clock: **GPS** = fix available (live or saved), **GPS?** = module found, waiting for a fix. Nothing is shown after a timeout without a fix |
+| Setup form | Latitude and longitude are prefilled from the last fix; the checkbox **Use GPS module (fix only at boot)** enables the boot attempt |
 | Cold start | The first fix takes about 25 s outdoors (23 s cold start per the datasheet); indoors it may never arrive |
 
 Notes:
 
 - The older GPS Unit (AT6558, 9600 baud) works too. A GPS **Hat** on the 8-pin header uses other pins and is not detected; add its pins to `GPS_PINS` in the sketch.
-- The unit needs 5 V from the Grove port. The sketch enables the external output at boot; if no data arrives on battery power, try USB power.
-- The serial monitor shows `[GPS] module detected ...` and `gps=fix|no-fix|none|off` in the `[LOOP]` lines.
+- The unit needs 5 V from the Grove port. The sketch enables the output only for the boot attempt and turns it off afterwards; this removes the continuous GPS standby load.
+- No continuous position updates: if you move the device while it runs, power-cycle it to take a new fix. The serial monitor shows `[GPS] boot fix attempt`, `[GPS] fix saved` and `[GPS] powered off (boot-only)`.
+
+### Power profiles
+
+| Setting | Normal | Balanced (default) | Eco |
+|---|---|---|---|
+| Poll with aircraft | 15 s | 30 s | 60 s |
+| Poll without aircraft | 30 s | 60 s | 120 s |
+| Brightness | 100 % | 70 % | 50 % |
+| Auto-dim | off | 60 s → 20 % | 30 s → 10 % |
+| Wi-Fi TX power | 19.5 dBm | 11 dBm | 8.5 dBm |
+| Idle deep sleep | 5 min → 60 s | 2 min → 5 min | 2 min → 15 min |
+
+- Any button restores the configured brightness after auto-dim.
+- Deep sleep never runs while charging.
+- After a deep-sleep wake the device polls once and sleeps again after 30 s if there are no aircraft.
+- **Power log:** enable `Log power samples to flash` in setup; the device writes `/power.csv` every 10 s. For a battery test, charge it, unplug USB, let it run, then download the CSV and average the `mA` column. `epoch` is Unix time when NTP is synced, otherwise uptime seconds. `[POWER]` lines are also printed to the serial monitor.
 
 ## Usage
 
@@ -228,7 +250,8 @@ Notes:
 | **8 Radar map** | next page | **jump to page 1 (detail)** | next aircraft **inside current scale** | countdown → reset | **change scale** |
 | 9 Nearby list | next page | next page | next aircraft (highlighted row) | countdown → reset | units km/ft ↔ NM/FL |
 | 10 Statistics | next page | next page | – (no visible effect) | countdown → reset | units km/ft ↔ NM/FL |
-| 11 Data quality | next page | next page | next aircraft | countdown → reset | units km/ft ↔ NM/FL |
+| 11 Military stats | next page | next page | – (no visible effect) | countdown → reset | next page of types |
+| 12 Data quality | next page | next page | next aircraft | countdown → reset | units km/ft ↔ NM/FL |
 
 Notes:
 
@@ -277,7 +300,7 @@ stateDiagram-v2
 
 ### Pages
 
-Eleven pages, advanced with `BtnA`. Pages 1–7 show the currently selected aircraft; pages 8–11 are overview pages.
+Twelve pages, advanced with `BtnA`. Pages 1–7 show the currently selected aircraft; pages 8–12 are overview pages.
 
 ```mermaid
 flowchart LR
@@ -291,22 +314,23 @@ flowchart LR
     P8["8 Radar map<br/>north-up, scalable"]
     P9["9 Nearby list<br/>5 closest aircraft"]
     P10["10 Statistics<br/>today's records"]
-    P11["11 Data quality<br/>SRC / NIC / NACp"]
+    P11["11 MIL TODAY<br/>4 types + count"]
+    P12["12 Data quality<br/>SRC / NIC / NACp"]
 
     P1 -->|BtnA| P2 -->|BtnA| P3 -->|BtnA| P4 -->|BtnA| P5 -->|BtnA| P6 -->|BtnA| P7
-    P7 -->|BtnA| P8 -->|BtnA| P9 -->|BtnA| P10 -->|BtnA| P11 -->|BtnA| P1
+    P7 -->|BtnA| P8 -->|BtnA| P9 -->|BtnA| P10 -->|BtnA| P11 -->|BtnA| P12 -->|BtnA| P1
     P8 -. "BtnA long press (0.6 s)" .-> P1
     P8 -. "BtnC: scale 100 / 50 / 25 % of radius" .-> P8
 
     classDef aircraft fill:#1f3a5f,stroke:#4a90d9,color:#fff;
     classDef overview fill:#2d4a2d,stroke:#6abf69,color:#fff;
     class P1,P2,P3,P4,P5,P6,P7 aircraft;
-    class P8,P9,P10,P11 overview;
+    class P8,P9,P10,P11,P12 overview;
 ```
 
 An **alert** (emergency, military, watchlist, rare aircraft, close pass or overhead) automatically selects that aircraft, jumps to page 1 and plays a sound (unless quiet hours are active).
 
-**Page 11 – data quality** shows the source of the position (`ADS-B`, `MLAT`, `TIS-B`, `ADS-C`), phase of flight (`CLB`, `CRZ`, `DES`, `APP`, `TAXI`) with its age in seconds, NIC/RC, NACp/SIL, ADS-B version, emitter category (e.g. `A3 Large`, `A7 Rotorcraft`), wind components and the registration country derived from the registration prefix. There is no status footer: pages contain only the data itself, and the version is shown in the setup page and the serial banner.
+**Page 12 – data quality** shows the source of the position (`ADS-B`, `MLAT`, `TIS-B`, `ADS-C`), phase of flight (`CLB`, `CRZ`, `DES`, `APP`, `TAXI`) with its age in seconds, NIC/RC, NACp/SIL, ADS-B version, emitter category (e.g. `A3 Large`, `A7 Rotorcraft`), wind components and the registration country derived from the registration prefix. There is no status footer: pages contain only the data itself, and the version is shown in the setup page and the serial banner.
 
 ### Radar map scale
 
@@ -339,7 +363,7 @@ flowchart TD
     A([Power on]) --> B{WiFi settings saved?}
     B -- no --> C["Setup mode<br/>AP + web form"] --> D[Save and reboot] --> B
     B -- yes --> E[Connect to Wi-Fi + NTP]
-    E --> E2["Position: live GPS fix<br/>or saved coordinates"] --> F["Poll adsb.lol /v2/point<br/>fallback: adsb.fi"]
+    E --> E2["Position: boot GPS fix<br/>or saved coordinates"] --> F["Poll adsb.lol /v2/point<br/>fallback: adsb.fi"]
     F --> G["Stream-parse aircraft<br/>one object at a time"]
     G --> H["Keep 5 closest + 40 map blips<br/>update daily stats"]
     H --> I{Alert?}
@@ -349,17 +373,17 @@ flowchart TD
     K --> L["Route lookup in background task<br/>adsb.im, max 3 attempts"]
     L --> M["Redraw every second<br/>dead reckoning between polls"]
     M --> F
-    M --> N{"5 min without<br/>aircraft or buttons?"}
-    N -- yes --> O[Deep sleep 60 s, then restart]
+    M --> N{"Profile idle<br/>timeout reached?"}
+    N -- yes --> O["Deep sleep (profile: 60 s / 5 min / 15 min)"]
 ```
 
 ### Polling intervals
 
 | Situation | Interval |
 |---|---|
-| Aircraft found | 15 s |
-| No aircraft | 30 s |
-| Other error (parse, 5xx, timeout) | 60 s |
+| Aircraft found | 15 / 30 / 60 s (Normal / Balanced / Eco) |
+| No aircraft | 30 / 60 / 120 s |
+| Other error (parse, 5xx, timeout) | max(idle interval, 60 s) |
 | HTTP 429 (rate limit) | 20 s, doubling up to 120 s (the `Retry-After` header wins); the fallback server is tried immediately; last data stays on screen |
 | Redraw of pages 7–9 (local calculation, no API call) | 1 s |
 | Route lookup (adsb.im, background task) | once per selected aircraft; a failed lookup is retried after 60 s, max 3 attempts |
@@ -378,8 +402,9 @@ Between polls, positions on pages 7–9 are recalculated every second from groun
 | Linker error `undefined reference to setup/loop` | File/folder name mismatch (`nearPlane/nearPlane.ino`) |
 | Reboot loop | Check the serial monitor (115200 baud) for the `Reset reason:` line |
 | No reaction to `BtnC` | The power button is not detected by your board or library version |
-| `GPS?` never turns into `GPS` | No satellite fix yet: move the unit outdoors or near a window and wait a few minutes |
-| No `GPS` indicator at all | Module not detected: check the Grove cable and power, and that **Use GPS module if connected** is enabled in setup |
+| `GPS?` never turns into `GPS` | No fix within the 60 s boot window. Move the unit outdoors and power-cycle it; the module is switched off after the attempt |
+| No `GPS` indicator at all | Module not detected at boot: check the Grove cable and that **Use GPS module (fix only at boot)** is enabled |
+| Power log is empty | Enable **Log power samples to flash**, wait at least 10 s, then download `/power.csv` |
 | Wi-Fi dropped and never came back | Fixed in v4.1: the device reconnects with a 5–60 s backoff; after 10 minutes without a connection it opens the setup AP again |
 | Setup Wi-Fi disappeared while configuring | Setup-mode idle timeout (10 minutes, paused while charging). Power-cycle the device to reopen it, or hold `BtnB` 5 s for a settings reset |
 | Clock off by one hour | `TZ_INFO` does not match your timezone; the default is CET/CEST with automatic daylight saving |
@@ -407,7 +432,8 @@ The serial monitor (115200 baud) prints one prefixed line per subsystem:
 | `[RATE]` | remaining data-source quota and proactive switch to the fallback |
 | `[OTA]` | firmware upload progress and result |
 | `[AIRCRAFT]` | API poll, HTTP status, scan counters, heap before/after TLS |
-| `[GPS]` | module detection, pin/baud combination, fix state |
+| `[GPS]` | boot fix attempt, saved fix, module detection, power-off |
+| `[POWER]` | 10 s battery current, level, Wi-Fi state, page, poll interval, GPS state, brightness |
 
 ## Data sources
 
@@ -425,6 +451,8 @@ adsb.lol allows a limited number of requests per day (the API returns `x-ratelim
 - enrichment requests are skipped while the remaining quota is below 50.
 
 Route lookups are cached for 7 days per callsign (`rcache` in NVS), enrichment results for 30 days (`ecache`), so repeat requests are avoided.
+
+Only an average interval of at least ~3 minutes stays within the 500/day quota. Normal and Balanced trade this for responsiveness and therefore use the fallback source for part of the day.
 
 ## Limitations
 
@@ -444,7 +472,7 @@ The detailed bilingual changelog (English/Slovak) with controls and release note
 
 ### This fork
 
-- Eleven pages instead of six, including radar map, nearby list, daily statistics and data quality.
+- Twelve pages instead of six, including radar map, nearby list, daily statistics, military statistics and data quality.
 - Tracks the 5 closest aircraft and switches between them with `BtnB`.
 - Direction page with dead reckoning, approach/recede trend, bearing and CPA.
 - Emergency, military and rare aircraft alerts with coloured banners, sounds and automatic selection.
@@ -455,12 +483,14 @@ The detailed bilingual changelog (English/Slovak) with controls and release note
 - Streaming JSON parsing for low memory usage; route fetched once per aircraft.
 - Fixed HTTP 403/426/429 handling, automatic adsb.fi fallback, configurable User-Agent in the setup form, exponential polling backoff and serial diagnostics.
 - Setup radius corrected to nautical miles (max 250) and deep sleep after inactivity.
-- Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, live position and prefilled setup form.
+- Optional GPS module (M5Stack GPS Unit v1.1) with automatic pin/baud detection, a boot-time fix saved to flash and a prefilled setup form.
 - **v4.1 – robustness:** Wi-Fi auto-reconnect with backoff and fallback to the setup AP, setup-mode idle timeout, route lookup moved to a background task (UI and buttons no longer freeze) with up to 3 retries, server-side validation of the setup form, prefilled setup fields, automatic daylight saving via `TZ_INFO`, firmware version in the setup page and serial banner.
 - **v4.1 – build:** `platformio.ini` with pinned library versions, GitHub Actions compile check, build artifacts and `.DS_Store` removed from git.
 - **v4.2 – data quality:** page 11 shows the position source and age, NIC/RC, NACp/SIL, ADS-B version, emitter category and registration country.
 - **v4.2 – alerts and storage:** watchlist rules, CPA and overhead alarms, quiet hours, a LittleFS sightings log, route/enrichment caches, quota-aware fallback and OTA updates.
 - **v4.3 – radar scale:** map steps are **100 / 50 / 25 %** of the configured scan radius; the default 50 NM radius gives 50 → 25 → 12.5 NM.
+- **v4.4 – military statistics:** page 11 (`MIL TODAY`) lists military aircraft by type and registration country with daily unique counts, 4 records per page and `BtnC` paging; stored in NVS and reset at midnight.
+- **v4.5 – power:** Normal/Balanced/Eco profiles, 70 % brightness with auto-dim, boot-only GPS with NVS fix reuse, Wi-Fi TX power control, loop yield, no deep sleep while charging and optional `/power.csv` battery diagnostics.
 
 ### Upstream history
 

@@ -1,6 +1,6 @@
 # nearPlane+ – Changelog & Controls / Zmeny a ovládanie
 
-nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.3)
+nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.5)
 
 **Language / Jazyk:** [English](#english) · [Slovenčina](#slovenčina)
 
@@ -89,14 +89,31 @@ nearPlane+ · M5StickC Plus2 ADS-B tracker · Firmware `nearPlane.ino` (v4.3)
 ### 2.11 GPS module (optional)
 - Supports the M5Stack GPS Unit v1.1 (AT6668 + MAX2659) on the Grove port; the older AT6558 unit works as well.
 - Wire orientation (G32/G33) and baud rate (115200 / 9600) are detected automatically from valid NMEA sentences (checksum verified).
-- The live GPS position replaces the saved coordinates: the API query, distances, bearings and the radar map use it; a fix up to 10 min old is kept, then the saved position is used.
-- Setup form: latitude/longitude are prefilled from the GPS, new checkbox **Use GPS module if connected**.
-- Display indicator `GPS` (live fix) / `GPS?` (module found, no fix) below the clock; the serial log shows `gps=...` and the position source.
+- One position fix is taken at cold boot; the module is then powered off. The persisted fix is reused after deep-sleep wakes and reboots; there is no continuous tracking.
+- The API query, distances, bearings and radar map use the saved fix until the next cold boot; otherwise the setup coordinates are used.
+- Setup form: latitude/longitude are prefilled from the last fix; checkbox **Use GPS module (fix only at boot)**.
+- Display indicator `GPS` (fix available) / `GPS?` (module found, no fix); serial log shows `[GPS] boot fix attempt`, `[GPS] fix saved`, `[GPS] powered off (boot-only)`.
 
 ### 2.12 Other changes
 - Page 5: the `CAT` row was replaced by `REG` (registration), because the header no longer shows it when the airline is known.
 - Route (`DEP > ARR`) is fetched only for the selected aircraft and only once.
 - BtnC hold time for the buzzer toggle shortened from 2 s to 0.75 s (750 ms).
+
+### 2.13 Military statistics (page 11, `MIL TODAY`)
+- Daily table of military aircraft (`dbFlags` bit 0) grouped by ICAO type and registration country.
+- One row per type + country with the number of unique aircraft (ICAO hex) seen that day; ground aircraft are included.
+- No headers or summary: 4 records per page in the same font as the TODAY page; `BtnC` short press cycles the list.
+- Unknown type and missing registration country are left blank; `BtnB` has no effect on this page.
+- Stored in NVS under `mil` every 10 minutes and before sleep; resets at midnight; requires NTP.
+
+### 2.14 Power profiles and diagnostics
+- Normal / Balanced / Eco profiles control poll interval, brightness, Wi-Fi TX power and idle deep sleep; Balanced is the default.
+- Auto-dim after 60 s (Balanced) or 30 s (Eco) without a button; any button restores the configured brightness.
+- GPS is boot-only: one fix at cold boot, saved to NVS, Grove 5 V off afterwards; deep-sleep wakes reuse the saved fix.
+- Deep sleep is skipped while charging; after a wake the device polls once and sleeps again after 30 s without aircraft.
+- Optional `/power.csv` log (10 s battery current) with download/clear in setup; `[POWER]` serial lines.
+- The main loop yields 10 ms instead of busy-spinning; unused IMU and microphone are disabled.
+- New NVS keys: `profile`, `plog`, `gpsfix`, `glat`, `glon`.
 
 ## 3. Controls
 
@@ -126,14 +143,16 @@ BtnC is the third button of the M5StickC Plus2 (the power button, exposed as `M5
 | 8 | Radar map |
 | 9 | Nearby list |
 | 10 | Daily statistics |
+| 11 | Military statistics |
+| 12 | Data quality |
 
 ## 5. Polling intervals
 
 | Situation | Interval |
 |---|---|
-| Aircraft found | 15 s |
-| No aircraft | 30 s |
-| Other error (parse, 5xx, timeout) | 60 s |
+| Aircraft found | 15 / 30 / 60 s (Normal / Balanced / Eco) |
+| No aircraft | 30 / 60 / 120 s |
+| Other error (parse, 5xx, timeout) | max(idle interval, 60 s) |
 | HTTP 429 | 20 s, doubling up to 120 s (`Retry-After` wins) + fallback server |
 | Page 7/8/9 redraw (local calculation, no API call) | 1 s |
 
@@ -143,7 +162,7 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 
 - The sketch must be saved as `nearPlane/nearPlane.ino` (folder name = file name), otherwise the linker reports undefined `setup`/`loop`.
 - The device has no compass: arrows and the map are always north-up, also when the GPS position changes.
-- The GPS needs a satellite fix (about 25 s outdoors); until then, or when no module is detected, the coordinates saved in setup are used.
+- The GPS needs a satellite fix (about 25 s outdoors); during the boot attempt, or when no module is detected, the coordinates saved in setup are used.
 - adsb.lol requires a real contact in the User-Agent – enter it in the setup form (field **User-Agent**).
 - Radius is entered in nautical miles (1 NM = 1.852 km).
 - Stats and the clock need a working NTP connection.
@@ -292,6 +311,21 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 - With the default 50 NM radius the steps are 50 → 25 → 12.5 NM; the map label shows percentage and absolute range (e.g. `R 50% 25.0 NM`).
 - Fixed the unit mismatch: the setup radius is in NM, while the old scale steps were hardcoded in km.
 
+## 12. v4.4 – military statistics
+
+- New page 11 (`MIL TODAY`) with a daily type table for military aircraft only: ICAO type, registration country and unique-aircraft count.
+- Military detection uses `dbFlags` bit 0, the same source as the MILITARY alert.
+- Four records per page in the TODAY-page font, no headers or summary; `BtnC` short press cycles the type list.
+- Single NVS blob `mil` (32 type rows, 64-entry hex ring); the daily reset clears it together with the general statistics.
+
+## 13. v4.5 – power optimisation
+
+- Added Normal / Balanced / Eco profiles (poll 15/30/60 s, brightness 100/70/50 %, TX 19.5/11/8.5 dBm, idle timeout 5/2/2 min, sleep 60 s/5 min/15 min).
+- Main loop yields 10 ms; unused IMU/microphone disabled; the display auto-dims after 60/30 s and any button restores brightness.
+- GPS now takes a single fix at cold boot, stores it in NVS and powers the Grove port off; deep-sleep wakes reuse it.
+- Deep sleep is skipped while charging and wakes with a 30 s no-aircraft grace.
+- Optional `/power.csv` power log and `[POWER]` serial diagnostics; README setup/GPS sections updated.
+
 ---
 
 <a id="slovenčina"></a>
@@ -377,14 +411,31 @@ Constants are at the top of the file (`SHORT_POLL_INTERVAL` etc.).
 ### 2.11 GPS modul (voliteľný)
 - Podporuje M5Stack GPS Unit v1.1 (AT6668 + MAX2659) na porte Grove; funguje aj staršia jednotka s AT6558.
 - Orientácia vodičov (G32/G33) a rýchlosť (115200 / 9600 baud) sa zistia automaticky z platných NMEA viet (kontroluje sa kontrolný súčet).
-- Živá poloha z GPS nahradí uložené súradnice: dopyt na API, vzdialenosti, smery aj radar mapa ju používajú; fix starý do 10 min sa drží, potom sa použije uložená poloha.
-- Formulár nastavenia: zemepisná šírka a dĺžka sa predvyplnia z GPS, nový checkbox **Use GPS module if connected**.
-- Indikátor na displeji `GPS` (živý fix) / `GPS?` (modul nájdený, bez fixu) pod hodinami; sériový log ukazuje `gps=...` a zdroj polohy.
+- Jeden fix sa spraví pri cold boote; modul sa potom vypne. Uložený fix sa použije po deep-sleep wake a reštarte; nepretržité sledovanie nebeží.
+- Dopyt na API, vzdialenosti, smery aj radar mapa používajú uložený fix do ďalšieho cold bootu; inak sa použijú súradnice z nastavenia.
+- Formulár nastavenia: zemepisná šírka a dĺžka sa predvyplnia z posledného fixu; checkbox **Use GPS module (fix only at boot)**.
+- Indikátor `GPS` (fix dostupný) / `GPS?` (modul nájdený, bez fixu); sériový log ukazuje `[GPS] boot fix attempt`, `[GPS] fix saved`, `[GPS] powered off (boot-only)`.
 
 ### 2.12 Ostatné zmeny
 - Stránka 5: riadok `CAT` nahradený riadkom `REG` (registrácia), keďže ju hlavička pri známej aerolínii už neukazuje.
 - Trasa (`DEP > ARR`) sa sťahuje len pre vybrané lietadlo a len raz.
 - Doba držania BtnC pre prepnutie bzučiaka skrátená z 2 s na 0,75 s (750 ms).
+
+### 2.13 Vojenská štatistika (stránka 11, `MIL TODAY`)
+- Denná tabuľka vojenských lietadiel (`dbFlags` bit 0) zoskupená podľa ICAO typu a krajiny registrácie.
+- Jeden riadok na typ + krajinu s počtom unikátnych lietadiel (ICAO hex) za deň; lietadlá na zemi sa počítajú tiež.
+- Bez hlavičiek a súhrnu: 4 záznamy na stránku rovnakým písmom ako stránka TODAY; `BtnC` krátko listuje zoznam.
+- Neznámy typ aj chýbajúca krajina registrácie zostanú prázdne; `BtnB` na tejto stránke nič nerobí.
+- Ukladá sa do NVS pod kľúčom `mil` každých 10 minút a pred uspatím; o polnoci sa vynuluje; vyžaduje NTP.
+
+### 2.14 Power profily a diagnostika
+- Profily Normal / Balanced / Eco riadia poll interval, jas, Wi-Fi TX power a idle deep sleep; default je Balanced.
+- Auto-dim po 60 s (Balanced) alebo 30 s (Eco) bez tlačidla; prvé stlačenie vráti nastavený jas.
+- GPS je boot-only: jeden fix pri cold boote, uloží sa do NVS, Grove 5 V sa vypne; deep-sleep wake použije uložený fix.
+- Deep sleep sa nevykoná pri nabíjaní; po prebudení zariadenie pollne raz a po 30 s bez lietadiel znovu spí.
+- Voliteľný `/power.csv` log (10 s batériový prúd) s download/clear v setup; `[POWER]` sériové riadky.
+- Hlavná slučka má 10 ms yield namiesto busy-spin; nepoužívané IMU a mikrofón sú vypnuté.
+- Nové NVS kľúče: `profile`, `plog`, `gpsfix`, `glat`, `glon`.
 
 ## 3. Ovládanie
 
@@ -414,14 +465,16 @@ BtnC je tretie tlačidlo M5StickC Plus2 (vypínacie tlačidlo, v knižnici `M5.B
 | 8 | Radar mapa |
 | 9 | Zoznam blízkych lietadiel |
 | 10 | Denná štatistika |
+| 11 | Vojenská štatistika |
+| 12 | Kvalita dát |
 
 ## 5. Intervaly volania API
 
 | Situácia | Interval |
 |---|---|
-| Lietadlo nájdené | 15 s |
-| Žiadne lietadlo | 30 s |
-| Iná chyba (parse, 5xx, timeout) | 60 s |
+| Lietadlo nájdené | 15 / 30 / 60 s (Normal / Balanced / Eco) |
+| Žiadne lietadlo | 30 / 60 / 120 s |
+| Iná chyba (parse, 5xx, timeout) | max(idle interval, 60 s) |
 | HTTP 429 | 20 s, zdvojnásobuje sa až na 120 s (`Retry-After` má prednosť) + záložný server |
 | Prekreslenie stránok 7/8/9 (lokálny výpočet, bez API) | 1 s |
 
@@ -431,7 +484,7 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 
 - Skeč musí byť uložený ako `nearPlane/nearPlane.ino` (názov priečinka = názov súboru), inak linker hlási nedefinované `setup`/`loop`.
 - Zariadenie nemá kompas: šípky a mapa sú vždy orientované severom nahor, aj keď sa mení poloha z GPS.
-- GPS potrebuje fix zo satelitov (približne 25 s vonku); dovtedy, alebo keď modul nie je nájdený, sa používajú súradnice uložené v nastavení.
+- GPS potrebuje fix zo satelitov (približne 25 s vonku); počas boot pokusu, alebo keď modul nie je nájdený, sa používajú súradnice uložené v nastavení.
 - adsb.lol vyžaduje v User-Agent reálny kontakt – zadaj ho vo formulári nastavenia (pole **User-Agent**).
 - Rádius sa zadáva v nautických míľach (1 NM = 1,852 km).
 - Štatistika a hodiny potrebujú funkčné NTP pripojenie.
@@ -579,3 +632,18 @@ Konštanty sú na začiatku súboru (`SHORT_POLL_INTERVAL` a ďalšie).
 - Mierka radaru je teraz relatívna k nastavenému rádiusu skenovania namiesto pevných krokov 25 / 12,5 / 7,5 km: **100 % → 50 % → 25 %**.
 - Pri predvolenom rádiuse 50 NM sú kroky 50 → 25 → 12,5 NM; popis na mape zobrazuje percento aj absolútny dosah (napr. `R 50% 25.0 NM`).
 - Opravený nesúlad jednotiek: setupový rádius je v NM, staré kroky mierky boli napevno v km.
+
+## 12. v4.4 – vojenská štatistika
+
+- Nová stránka 11 (`MIL TODAY`) s dennou tabuľkou vojenských lietadiel: ICAO typ, krajina registrácie a počet unikátnych lietadiel.
+- Vojenské lietadlo sa určuje podľa `dbFlags` bitu 0, teda rovnakého zdroja ako pri MILITARY alerte.
+- Štyri záznamy na stránku rovnakým písmom ako stránka TODAY, bez hlavičiek a súhrnu; `BtnC` krátko listuje zoznam typov.
+- Jeden NVS blob `mil` (32 riadkov typov, ring 64 hexov); denný reset ho vynuluje spolu so všeobecnými štatistikami.
+
+## 13. v4.5 – optimalizácia spotreby
+
+- Pribudli profily Normal / Balanced / Eco (poll 15/30/60 s, jas 100/70/50 %, TX 19,5/11/8,5 dBm, idle timeout 5/2/2 min, sleep 60 s/5 min/15 min).
+- Hlavná slučka má 10 ms yield; nepoužívané IMU/mikrofón sú vypnuté; displej sa stmieva po 60/30 s a prvé tlačidlo vráti jas.
+- GPS teraz spraví jeden fix pri cold boote, uloží ho do NVS a vypne Grove port; deep-sleep wake ho použije.
+- Deep sleep sa preskočí pri nabíjaní a po prebudení má 30 s grace bez lietadiel.
+- Voliteľný `/power.csv` power log a `[POWER]` sériová diagnostika; README sekcie setup/GPS aktualizované.

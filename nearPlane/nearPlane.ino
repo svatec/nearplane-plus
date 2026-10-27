@@ -1,5 +1,5 @@
 // nearPlane+ - ADS-B tracker for the M5StickC Plus2
-// Optional: GPS module (M5Stack GPS Unit v1.1, AT6668) on the Grove port gives the live position.
+// Optional: GPS module (M5Stack GPS Unit v1.1, AT6668) on the Grove port gives a position fix at boot.
 // Features: multiple aircraft (BtnB short press), CPA, alerts (MIL/EMERG/RARE), radar map,
 //           daily statistics (NVS), aircraft type and airline names.
 //
@@ -45,7 +45,7 @@ DNSServer dnsServer;
 M5Canvas canvas(&M5.Display);
 
 // Firmware version, shown in the footer, in the setup page and in the serial banner
-const char* FW_VERSION = "v4.3";
+const char* FW_VERSION = "v4.5";
 
 // Default User-Agent, used only when none is saved in the setup form.
 // adsb.lol requires a User-Agent with real contact info (e-mail or URL).
@@ -56,17 +56,33 @@ String userAgent = USER_AGENT;       // active value (from setup form / NVS key 
 const int PAGE_TRACK = 6;   // arrow + distance + CPA
 const int PAGE_MAP   = 7;   // radar map
 const int PAGE_LIST  = 8;   // list of nearest aircraft
-const int PAGE_STATS = 9;   // daily statistics
-const int PAGE_DATA  = 10;  // data quality / source details
-const int NUM_PAGES  = 11;
+const int PAGE_STATS = 9;      // daily statistics
+const int PAGE_MILSTATS = 10;  // daily statistics for military aircraft
+const int PAGE_DATA  = 11;     // data quality / source details
+const int NUM_PAGES  = 12;
 
 // ---------------------------------------------------------------- polling
-const unsigned long SHORT_POLL_INTERVAL = 15000;        // aircraft found: 15 s
-const unsigned long NO_AIRCRAFT_POLL_INTERVAL = 30000;  // no aircraft: 30 s
+const unsigned long SHORT_POLL_INTERVAL = 15000;        // Normal profile: aircraft found
+const unsigned long NO_AIRCRAFT_POLL_INTERVAL = 30000;  // Normal profile: no aircraft
 const unsigned long ERROR_POLL_INTERVAL = 60000;        // other error: 60 s
 const unsigned long RATE_LIMIT_BACKOFF_MIN = 20000;     // after HTTP 429: 20 s, doubling...
 const unsigned long RATE_LIMIT_BACKOFF_MAX = 120000;    // ...up to 120 s (Retry-After header wins)
-unsigned long pollInterval = SHORT_POLL_INTERVAL;
+
+// ---------------------------------------------------------------- power profiles
+// 0 = Normal, 1 = Balanced (default), 2 = Eco. Values are applied by applyPowerProfile().
+uint8_t powerProfile = 1;
+unsigned long pollActiveMs = 30000;
+unsigned long pollIdleMs = 60000;
+unsigned long pollInterval = pollActiveMs;
+unsigned long inactivityTimeoutMs = 120000;
+uint64_t deepSleepDurationS = 300;
+uint8_t baseBrightness = 178;
+uint8_t dimBrightness = 51;
+unsigned long autoDimMs = 60000;
+wifi_power_t wifiTxPower = WIFI_POWER_11dBm;
+bool screenDimmed = false;
+uint8_t appliedBrightness = 255;
+unsigned long lastButtonTime = 0;
 const long RESET_HOLD_TIME_MS = 5000;
 const long BTN_B_HOLD_MS = 1000;   // from this press length the reset countdown is shown
 
@@ -93,8 +109,6 @@ bool isResetting = false;
 unsigned long lastResetDraw = 0;
 
 unsigned long lastActivityTime = 0;
-const unsigned long INACTIVITY_TIMEOUT_MS = 300000;
-const uint64_t DEEP_SLEEP_DURATION_S = 60;
 
 const char* ntpServer = "pool.ntp.org";
 // POSIX TZ string pre Europe/Bratislava (CET/CEST) – letny cas sa prepina automaticky.
@@ -145,6 +159,26 @@ struct DayStats {
   char altFl[9];
   int maxGs;
   char gsFl[9];
+};
+
+// Vojenske statistiky: tabulka typov za den, deduplikacia podla ICAO hexu.
+const int MIL_SEEN_MAX = 64;   // max. unikatnych vojenskych lietadiel za den
+const int MIL_TYPE_MAX = 32;   // max. riadkov typ + krajina za den
+const int MIL_ROWS = 4;        // riadkov na jednu obrazovku
+
+struct MilTypeStat {
+  char type[6];           // ICAO typ, uppercase, "" ak chyba
+  char cc[3];             // ISO krajina z registracie, "" ak chyba
+  uint16_t count;         // unikatne lietadla typu/krajiny za den
+};
+
+struct MilStore {
+  uint32_t day;
+  uint16_t total;         // unikatne vojenske lietadla za den
+  uint8_t typeCount;
+  uint8_t seenN;
+  MilTypeStat types[MIL_TYPE_MAX];
+  uint32_t seenHex[MIL_SEEN_MAX];
 };
 
 struct KV { const char* k; const char* v; };
@@ -229,6 +263,8 @@ JsonDocument objFilter;
 DayStats stats;
 uint32_t seenHex[SEEN_MAX];
 int seenN = 0;
+MilStore mil;
+uint8_t milPage = 0;
 bool statsDirty = false;
 bool statsActive = false;
 unsigned long lastStatsSave = 0;
@@ -274,10 +310,16 @@ int consecutive429 = 0;
 bool rateLimited = false;            // last request was rate limited (shows a status screen)
 // ---- GPS (optional): M5Stack GPS Unit v1.1 (AT6668 + MAX2659) on the Grove port
 HardwareSerial GPSSerial(1);
-bool gpsEnabled = true;              // setting "Use GPS module if connected" (NVS key "gps")
+bool gpsEnabled = true;              // setting "Use GPS module (fix only at boot)" (NVS key "gps")
 bool gpsDetected = false;            // valid NMEA sentences are arriving
 bool gpsEverFix = false;             // at least one valid position received
 bool gpsGaveUp = false;              // no module found after several detection rounds
+bool gpsBootGotFix = false;          // a fix arrived during the current boot attempt
+bool gpsPowerOff = false;            // Grove 5 V / GPS is off (boot-only mode)
+bool gpsFixSaved = false;            // NVS contains a usable fix from an earlier boot
+unsigned long gpsBootDeadline = 0, gpsDetectDeadline = 0;
+const unsigned long GPS_FIX_WAIT_MS = 60000;       // max wait for a fix at cold boot
+const unsigned long GPS_DETECT_WAIT_MS = 13000;    // max module detection time
 double gpsLat = 0, gpsLon = 0;
 int gpsSats = 0;
 unsigned long gpsLastFixMs = 0, gpsLastSeenMs = 0, gpsComboStart = 0;
@@ -354,6 +396,8 @@ bool btnCDown = false, btnCToggled = false;
 unsigned long btnCStart = 0;
 const unsigned long BTN_C_HOLD_MS = 750;   // hold BtnC this long to toggle the buzzer
 unsigned long toastUntil = 0;        // on-screen message visible until this time
+bool powerLogEnabled = false;        // NVS "plog"
+unsigned long lastPowerLog = 0;
 // radar map scale as a fraction of the configured radius (100 / 50 / 25 %)
 const float MAP_SCALE_PCT[] = {1.0f, 0.5f, 0.25f};
 const int MAP_SCALE_STEPS = sizeof(MAP_SCALE_PCT) / sizeof(MAP_SCALE_PCT[0]);
@@ -431,7 +475,7 @@ const char* RARE_TYPES[] = {
 #define KV_COUNT(x) (sizeof(x) / sizeof(x[0]))
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input,select{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus,select:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="32" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="%RADIUS%" min="1" max="250" required><label for="units">Units</label><select id="units" name="units"><option value="km"%SELKM%>km / ft</option><option value="nm"%SELNM%>NM / FL</option></select><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="%UA%" maxlength="120" placeholder="nearPlane-M5Stick/1.0 (you@example.com)" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label for="watch">Watchlist (comma separated: OK-*, SP-*, @DLH, A388, 4CA123)</label><input type="text" id="watch" name="watch" value="%WATCH%" maxlength="120" placeholder="OK-*, SP-*, @DLH"><label for="cpakm">CPA alarm distance (km, 0.5-20)</label><input type="number" id="cpakm" name="cpakm" value="%CPAKM%" min="0.5" max="20" step="0.5" required><label for="cpamin">CPA alarm time window (minutes, 1-15)</label><input type="number" id="cpamin" name="cpamin" value="%CPAMIN%" min="1" max="15" required><label for="elev">Overhead alarm elevation (degrees, 30-89)</label><input type="number" id="elev" name="elev" value="%ELEV%" min="30" max="89" required><label for="qfrom">Quiet hours (from / to, 0-23; equal = off)</label><input type="number" id="qfrom" name="qfrom" value="%QFROM%" min="0" max="23" required><input type="number" id="qto" name="qto" value="%QTO%" min="0" max="23" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_emerg" value="1" style="width:auto;margin:0 10px 0 0" %A_EMERG%>Alarm: emergency</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_mil" value="1" style="width:auto;margin:0 10px 0 0" %A_MIL%>Alarm: military</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_rare" value="1" style="width:auto;margin:0 10px 0 0" %A_RARE%>Alarm: rare type</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_watch" value="1" style="width:auto;margin:0 10px 0 0" %A_WATCH%>Alarm: watchlist</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_cpa" value="1" style="width:auto;margin:0 10px 0 0" %A_CPA%>Alarm: close pass (CPA)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_over" value="1" style="width:auto;margin:0 10px 0 0" %A_OVER%>Alarm: overhead</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gnd" value="1" style="width:auto;margin:0 10px 0 0" %GNDCHK%>Hide aircraft on the ground</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module if connected (live position)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="log" value="1" style="width:auto;margin:0 10px 0 0" %LOGCHK%>Log sightings to flash (CSV)</label><button type="submit">Save & Reboot</button></form><button type="button" onclick="location.href='/log.csv'" style="background:#34c759;margin-bottom:10px">Download log (%LOGSIZE% kB)</button><form action="/log/clear" method="POST"><button type="submit" style="background:#86868b;margin-bottom:10px">Clear log</button></form><button type="button" onclick="location.href='/update'" style="background:#ff9500">Firmware update</button></div><div class="footer">nearPlane+ %VER% - M5StickC Plus 2 Edition</div></body></html>
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>nearPlane+ Tracker Setup</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f5f5f7;color:#1d1d1f}.container{padding:25px;max-width:550px;margin:30px auto;background-color:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.1)}h1{color:#1d1d1f;text-align:center;margin-bottom:25px;font-weight:600}form{display:flex;flex-direction:column}label{margin-bottom:8px;color:#6e6e73;font-weight:500}input,select{padding:14px;margin-bottom:20px;border:1px solid #d2d2d7;border-radius:8px;font-size:16px;transition:border-color .2s,box-shadow .2s}input:focus,select:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.25);outline:none}button{background-color:#007aff;color:#fff;padding:16px;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;transition:background-color .2s}button:hover{background-color:#0056b3}.footer{text-align:center;margin-top:20px;color:#86868b;font-size:12px}</style></head><body><div class="container"><h1>nearPlane+ ADSB Tracker Setup</h1><p style="text-align:center;color:#6e6e73;margin:0 0 20px">%GPSMSG%</p><form action="/save" method="POST"><label for="ssid">WiFi Network (SSID)</label><input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="32" required><label for="password">WiFi Password</label><input type="text" id="password" name="password"><label for="lat">Your Latitude</label><input type="text" id="lat" name="lat" required placeholder="e.g., 41.015137" value="%LAT%"><label for="lon">Your Longitude</label><input type="text" id="lon" name="lon" required placeholder="e.g., 28.979530" value="%LON%"><label for="radius">Scan Radius (NM, max 250)</label><input type="number" id="radius" name="radius" value="%RADIUS%" min="1" max="250" required><label for="units">Units</label><select id="units" name="units"><option value="km"%SELKM%>km / ft</option><option value="nm"%SELNM%>NM / FL</option></select><label for="profile">Power profile</label><select id="profile" name="profile"><option value="0"%SELPROF0%>Normal - 15 s poll, 100% brightness</option><option value="1"%SELPROF1%>Balanced - 30 s poll, 70% brightness</option><option value="2"%SELPROF2%>Eco - 60 s poll, 50% brightness</option></select><label for="ua">User-Agent (must contain your e-mail or URL)</label><input type="text" id="ua" name="user_agent" value="%UA%" maxlength="120" placeholder="nearPlane-M5Stick/1.0 (you@example.com)" pattern=".*(@|https?://).*" title="Include your e-mail or a URL" required><label for="watch">Watchlist (comma separated: OK-*, SP-*, @DLH, A388, 4CA123)</label><input type="text" id="watch" name="watch" value="%WATCH%" maxlength="120" placeholder="OK-*, SP-*, @DLH"><label for="cpakm">CPA alarm distance (km, 0.5-20)</label><input type="number" id="cpakm" name="cpakm" value="%CPAKM%" min="0.5" max="20" step="0.5" required><label for="cpamin">CPA alarm time window (minutes, 1-15)</label><input type="number" id="cpamin" name="cpamin" value="%CPAMIN%" min="1" max="15" required><label for="elev">Overhead alarm elevation (degrees, 30-89)</label><input type="number" id="elev" name="elev" value="%ELEV%" min="30" max="89" required><label for="qfrom">Quiet hours (from / to, 0-23; equal = off)</label><input type="number" id="qfrom" name="qfrom" value="%QFROM%" min="0" max="23" required><input type="number" id="qto" name="qto" value="%QTO%" min="0" max="23" required><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_emerg" value="1" style="width:auto;margin:0 10px 0 0" %A_EMERG%>Alarm: emergency</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_mil" value="1" style="width:auto;margin:0 10px 0 0" %A_MIL%>Alarm: military</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_rare" value="1" style="width:auto;margin:0 10px 0 0" %A_RARE%>Alarm: rare type</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_watch" value="1" style="width:auto;margin:0 10px 0 0" %A_WATCH%>Alarm: watchlist</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_cpa" value="1" style="width:auto;margin:0 10px 0 0" %A_CPA%>Alarm: close pass (CPA)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="a_over" value="1" style="width:auto;margin:0 10px 0 0" %A_OVER%>Alarm: overhead</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gnd" value="1" style="width:auto;margin:0 10px 0 0" %GNDCHK%>Hide aircraft on the ground</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="gps" value="1" style="width:auto;margin:0 10px 0 0" %GPSCHK%>Use GPS module (fix only at boot)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="log" value="1" style="width:auto;margin:0 10px 0 0" %LOGCHK%>Log sightings to flash (CSV)</label><label style="display:flex;align-items:center;margin-bottom:20px"><input type="checkbox" name="plog" value="1" style="width:auto;margin:0 10px 0 0" %PLOGCHK%>Log power samples to flash (10 s CSV)</label><button type="submit">Save & Reboot</button></form><button type="button" onclick="location.href='/log.csv'" style="background:#34c759;margin-bottom:10px">Download log (%LOGSIZE% kB)</button><form action="/log/clear" method="POST"><button type="submit" style="background:#86868b;margin-bottom:10px">Clear log</button></form><button type="button" onclick="location.href='/power.csv'" style="background:#34c759;margin-bottom:10px">Download power log (%PWRSIZE% kB)</button><form action="/power/clear" method="POST"><button type="submit" style="background:#86868b;margin-bottom:10px">Clear power log</button></form><button type="button" onclick="location.href='/update'" style="background:#ff9500">Firmware update</button></div><div class="footer">nearPlane+ %VER% - M5StickC Plus 2 Edition</div></body></html>
 )rawliteral";
 
 // ---------------------------------------------------------------- prototypes
@@ -766,7 +810,25 @@ void gpsSetFix(double lat, double lon) {
   gpsLat = lat;
   gpsLon = lon;
   gpsEverFix = true;
+  gpsBootGotFix = true;
   gpsLastFixMs = millis();
+}
+
+// Boot-only GPS: save the fix and cut power to the Grove port.
+void gpsStopBoot(bool save) {
+  if (save && gpsEverFix) {
+    preferences.putFloat("glat", (float)gpsLat);
+    preferences.putFloat("glon", (float)gpsLon);
+    preferences.putBool("gpsfix", true);
+    gpsFixSaved = true;
+    Serial.printf("[GPS] fix saved %.5f,%.5f\n", gpsLat, gpsLon);
+  }
+  GPSSerial.end();
+  M5.Power.setExtOutput(false);
+  gpsPowerOff = true;
+  gpsDetected = false;
+  gpsGaveUp = true;
+  Serial.println("[GPS] powered off (boot-only)");
 }
 
 void gpsHandleLine(char* line) {
@@ -815,8 +877,21 @@ void gpsFeed(int c) {
 }
 
 void gpsPoll() {
-  if (!gpsEnabled) return;
+  if (!gpsEnabled || gpsPowerOff) return;
   while (GPSSerial.available() > 0) gpsFeed(GPSSerial.read());
+
+  // Boot-only mode: the first valid fix is enough, then cut the 5 V output.
+  if (gpsBootGotFix) { gpsStopBoot(true); return; }
+  if (!gpsDetected && millis() >= gpsDetectDeadline) {
+    Serial.println("[GPS] module not detected before timeout");
+    gpsStopBoot(false);
+    return;
+  }
+  if (millis() >= gpsBootDeadline) {
+    Serial.println("[GPS] no fix before timeout");
+    gpsStopBoot(false);
+    return;
+  }
 
   if (gpsDetected && millis() - gpsLastSeenMs > 10000) {   // module unplugged: search again
     gpsDetected = false;
@@ -827,27 +902,67 @@ void gpsPoll() {
   }
   if (!gpsDetected && !gpsGaveUp && millis() - gpsComboStart > 1600) {
     gpsCombosTried++;
-    if (gpsCombosTried >= 20) {          // 5 rounds over all pin/baud combinations
+    if (gpsCombosTried >= 8) {           // 2 rounds over all pin/baud combinations
       gpsGaveUp = true;
-      GPSSerial.end();
-      Serial.println("[GPS] no module found (reboot to search again)");
+      gpsStopBoot(false);
     } else {
       gpsStartCombo((gpsCombo + 1) % 4);
     }
   }
 }
 
-// position updated within the last 5 s
+// position updated within the last 5 s (a saved boot fix counts as valid while GPS is off)
 bool gpsFixLive() {
-  return gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 5000;
+  return gpsEnabled && gpsEverFix && (gpsPowerOff || millis() - gpsLastFixMs < 5000);
 }
 
 // Home position = GPS position (while a fix is available, up to 10 min old), else the saved one
 void updateHomePosition() {
-  bool useGps = gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 600000UL;
+  bool useGps = gpsEnabled && gpsEverFix && (gpsPowerOff || millis() - gpsLastFixMs < 600000UL);
   if (useGps) { homeLat = gpsLat; homeLon = gpsLon; }
   else { homeLat = cfgLat; homeLon = cfgLon; }
   posFromGps = useGps;
+}
+
+void setBrightnessLevel(uint8_t b) {
+  M5.Display.setBrightness(b);
+  appliedBrightness = b;
+}
+
+void applyPowerProfile() {
+  switch (powerProfile) {
+    case 0:  // Normal: original behaviour, no dimming
+      pollActiveMs = SHORT_POLL_INTERVAL;
+      pollIdleMs = NO_AIRCRAFT_POLL_INTERVAL;
+      inactivityTimeoutMs = 300000;
+      deepSleepDurationS = 60;
+      baseBrightness = 255;
+      dimBrightness = 255;
+      autoDimMs = 0;
+      wifiTxPower = WIFI_POWER_19_5dBm;
+      break;
+    case 2:  // Eco
+      pollActiveMs = 60000;
+      pollIdleMs = 120000;
+      inactivityTimeoutMs = 120000;
+      deepSleepDurationS = 900;
+      baseBrightness = 128;
+      dimBrightness = 26;
+      autoDimMs = 30000;
+      wifiTxPower = WIFI_POWER_8_5dBm;
+      break;
+    default:  // Balanced
+      pollActiveMs = 30000;
+      pollIdleMs = 60000;
+      inactivityTimeoutMs = 120000;
+      deepSleepDurationS = 300;
+      baseBrightness = 178;
+      dimBrightness = 51;
+      autoDimMs = 60000;
+      wifiTxPower = WIFI_POWER_11dBm;
+      break;
+  }
+  pollInterval = pollActiveMs;
 }
 
 void buildUrls() {
@@ -860,10 +975,17 @@ void buildUrls() {
 }
 
 // ---------------------------------------------------------------- statistics
+void resetMilStats(uint32_t day) {
+  memset(&mil, 0, sizeof(mil));
+  mil.day = day;
+  milPage = 0;
+}
+
 void resetStats(uint32_t day) {
   memset(&stats, 0, sizeof(stats));
   stats.day = day;
   stats.minKm = 9999.0f;
+  resetMilStats(day);
   seenN = 0;
   statsDirty = true;
 }
@@ -874,6 +996,9 @@ void loadStats() {
   if (preferences.getBytesLength("stats") == sizeof(DayStats)) {
     preferences.getBytes("stats", &stats, sizeof(DayStats));
   }
+  if (preferences.getBytesLength("mil") == sizeof(MilStore)) {
+    preferences.getBytes("mil", &mil, sizeof(MilStore));
+  }
   size_t len = preferences.getBytesLength("seen");
   if (len > 0 && len <= sizeof(seenHex) && len % 4 == 0) {
     preferences.getBytes("seen", seenHex, len);
@@ -883,7 +1008,9 @@ void loadStats() {
 
 void saveStats() {
   preferences.putBytes("stats", &stats, sizeof(stats));
+  preferences.putBytes("mil", &mil, sizeof(mil));
   if (seenN > 0) preferences.putBytes("seen", seenHex, seenN * 4);
+  else preferences.remove("seen");
   statsDirty = false;
   lastStatsSave = millis();
 }
@@ -895,7 +1022,45 @@ void statsBeginScan() {
     uint32_t key = (t.tm_year + 1900) * 10000UL + (t.tm_mon + 1) * 100UL + t.tm_mday;
     statsActive = true;
     if (stats.day != key) resetStats(key);
+    else if (mil.day != key) {   // upgrade: military blob not stored yet, keep today's general stats
+      resetMilStats(key);
+      statsDirty = true;
+    }
   }
+}
+
+uint8_t milPageCount() {
+  return mil.typeCount ? (mil.typeCount + MIL_ROWS - 1) / MIL_ROWS : 1;
+}
+
+// Vojenske lietadlo = dbFlags bit 0, rovnaka definicia ako pri MILITARY alerte.
+// Pocita sa prvy vyskyt ICAO hexu v dni; dalsie polly toho isteho lietadla sa ignoruju.
+void milStatsUpdate(const Aircraft& a) {
+  if (!statsActive) return;
+  for (int i = 0; i < mil.seenN; i++) {
+    if (mil.seenHex[i] == a.hex32) return;
+  }
+  if (mil.seenN >= MIL_SEEN_MAX) return;   // ring full: cannot dedupe further
+  mil.seenHex[mil.seenN++] = a.hex32;
+  mil.total++;
+  statsDirty = true;
+
+  char type[sizeof(mil.types[0].type)];
+  cpy(type, sizeof(type), a.type);
+  for (char* p = type; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32;
+  const char* cc = regCountry(a.reg);
+
+  for (int i = 0; i < mil.typeCount; i++) {
+    if (strcmp(mil.types[i].type, type) == 0 && strcmp(mil.types[i].cc, cc) == 0) {
+      mil.types[i].count++;
+      return;
+    }
+  }
+  if (mil.typeCount >= MIL_TYPE_MAX) return;   // table full: total is counted, row is dropped
+  MilTypeStat& e = mil.types[mil.typeCount++];
+  cpy(e.type, sizeof(e.type), type);
+  cpy(e.cc, sizeof(e.cc), cc);
+  e.count = 1;
 }
 
 void statsUpdate(const Aircraft& a) {
@@ -926,6 +1091,7 @@ void statsUpdate(const Aircraft& a) {
     cpy(stats.gsFl, sizeof(stats.gsFl), name);
     statsDirty = true;
   }
+  if (a.dbFlags & 1) milStatsUpdate(a);
 }
 
 // ---------------------------------------------------------------- parsing
@@ -1732,6 +1898,60 @@ void handleLogClear() {
   server.send(303, "text/plain", "");
 }
 
+// ---- power diagnostics (optional CSV, 10 s samples; used for battery tests)
+size_t powerLogBytes() {
+  if (!logMounted) return 0;
+  File f = LittleFS.open("/power.csv", FILE_READ);
+  size_t n = f ? f.size() : 0;
+  if (f) f.close();
+  return n;
+}
+
+void logPowerSample() {
+  int mA = M5.Power.getBatteryCurrent();
+  int pct = M5.Power.getBatteryLevel();
+  time_t now = time(nullptr);
+  bool timeOk = now > 1600000000;
+  const char* gs = !gpsEnabled ? "off" : gpsPowerOff ? "saved" : gpsDetected ? "on" : "none";
+  String line = String(timeOk ? (unsigned long)now : (unsigned long)(millis() / 1000)) + "," +
+                String(mA) + "," + String(pct) + "," + String((int)WiFi.status()) + "," +
+                String(currentPage + 1) + "," + String(pollInterval / 1000) + "," +
+                gs + "," + String((int)appliedBrightness) + "," +
+                (M5.Power.isCharging() ? "chg" : "bat") + "\n";
+  if (logMounted) {
+    File f = LittleFS.open("/power.csv", FILE_APPEND);
+    if (f) {
+      if (f.size() == 0) f.print("epoch,mA,level,wifi,page,poll_s,gps,bright,power\n");
+      if (f.size() < 200000) f.print(line);
+      f.close();
+    }
+  }
+  Serial.print("[POWER] ");
+  Serial.print(line);
+}
+
+void handlePowerCsv() {
+  lastActivityTime = millis();
+  File f = LittleFS.open("/power.csv", FILE_READ);
+  if (!f) {
+    server.send(404, "text/plain", "Power log is empty");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=power.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handlePowerClear() {
+  lastActivityTime = millis();
+  if (logMounted) {
+    LittleFS.remove("/power.csv");
+    Serial.println("[POWER] log cleared from the web page");
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 void handleOtaPage() {
   lastActivityTime = millis();
   String html =
@@ -1775,21 +1995,36 @@ void setup() {
   delay(1000);
   Serial.println();
   Serial.printf("nearPlane+: start (%s)\n", FW_VERSION);
+  int resetReason = (int)esp_reset_reason();
   {
-    int rr = (int)esp_reset_reason();
+    int rr = resetReason;
     const char* txt = rr == 1 ? "power-on" : rr == 3 ? "software restart" : rr == 4 ? "PANIC / crash"
                     : rr == 5 ? "interrupt watchdog" : rr == 6 ? "task watchdog" : rr == 7 ? "other watchdog"
                     : rr == 8 ? "deep sleep wake" : rr == 9 ? "BROWNOUT (low voltage)" : "other";
     Serial.printf("Reset reason: %d (%s)\n", rr, txt);
   }
   auto cfg = M5.config();
+  cfg.internal_imu = false;            // IMU and microphone are not used
+  cfg.internal_mic = false;
   M5.begin(cfg);
   M5.Power.begin();
   M5.update();
   bool forceSetup = M5.BtnA.isPressed();   // hold BtnA at boot: setup AP without a factory reset
   preferences.begin("adsb-config", false);
+  powerProfile = preferences.getInt("profile", 1);
+  if (powerProfile > 2) powerProfile = 1;
+  applyPowerProfile();
+  powerLogEnabled = preferences.getBool("plog", false);
+  lastPowerLog = millis();
   soundOn = preferences.getBool("sound", true);
   gpsEnabled = preferences.getBool("gps", true);
+  gpsFixSaved = preferences.getBool("gpsfix", false);
+  if (gpsFixSaved) {
+    gpsLat = preferences.getFloat("glat", 0);
+    gpsLon = preferences.getFloat("glon", 0);
+    gpsEverFix = true;
+    gpsLastFixMs = millis();           // saved fix is usable for this session
+  }
   unitsMode = preferences.getInt("units", 0);
   hideGround = preferences.getBool("gnd", true);
   watchList = preferences.getString("watch", "");
@@ -1804,12 +2039,25 @@ void setup() {
   loadCaches();
   logBegin();          // mount always: the log can be downloaded/cleared even when logging is off
   if (!logEnabled) Serial.println("[LOG] logging disabled in settings");
-  M5.Power.setExtOutput(gpsEnabled);    // 5V on the Grove port only when GPS is enabled
-  if (gpsEnabled) gpsBegin();
+  M5.Power.setExtOutput(false);         // Grove 5 V stays off except during the boot fix
+  gpsPowerOff = true;
+  if (gpsEnabled && resetReason != 8 && !forceSetup) {
+    M5.Power.setExtOutput(true);
+    gpsBegin();
+    gpsBootDeadline = millis() + GPS_FIX_WAIT_MS;
+    gpsDetectDeadline = millis() + GPS_DETECT_WAIT_MS;
+    gpsPowerOff = false;
+    Serial.println("[GPS] boot fix attempt (up to 60 s)");
+  } else {
+    Serial.println(resetReason == 8 ? "[GPS] deep-sleep wake: using saved fix"
+                                    : forceSetup ? "[GPS] setup mode: GPS not started"
+                                                 : "[GPS] disabled in settings");
+  }
   M5.Speaker.setVolume(255);
   if (soundOn) M5.Speaker.tone(2000, 100);
   M5.Display.setRotation(1);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
+  setBrightnessLevel(baseBrightness);
   buildFilter();
   loadStats();
   // Jeden TLS request naraz; cesty sa tahaju v samostatnom tasku (core 0)
@@ -1827,6 +2075,11 @@ void setup() {
     loadSettingsAndConnect();
   }
   lastActivityTime = millis();
+  lastButtonTime = millis();
+  if (resetReason == 8) {              // after a deep-sleep wake: 30 s grace, then sleep again
+    unsigned long grace = inactivityTimeoutMs > 30000 ? inactivityTimeoutMs - 30000 : 0;
+    lastActivityTime = millis() - grace;
+  }
 }
 
 void loop() {
@@ -1837,7 +2090,11 @@ void loop() {
     lastHomeUpdate = millis();
     updateHomePosition();
   }
-  if (isResetting) { return; }
+  if (isResetting) { vTaskDelay(pdMS_TO_TICKS(10)); return; }
+  if (!configMode && autoDimMs > 0 && !screenDimmed && millis() - lastButtonTime > autoDimMs) {
+    screenDimmed = true;
+    setBrightnessLevel(dimBrightness);
+  }
   if (configMode) {
     dnsServer.processNextRequest();
     server.handleClient();
@@ -1854,11 +2111,11 @@ void loop() {
       canvas.setFont(&fonts::FreeSansBold12pt7b);
       canvas.drawString("Setup timeout", 120, 55);
       canvas.setFont(&fonts::FreeSans9pt7b);
-      canvas.drawString("Sleeping 60 s...", 120, 85);
+      canvas.drawString("Sleeping " + String((unsigned long)deepSleepDurationS) + " s...", 120, 85);
       canvas.pushSprite(0, 0);
       delay(2000);
       M5.Display.sleep();
-      M5.Power.deepSleep(DEEP_SLEEP_DURATION_S * 1000000ULL);
+      M5.Power.deepSleep(deepSleepDurationS * 1000000ULL);
     }
   } else {
     ensureWifi();
@@ -1901,13 +2158,19 @@ void loop() {
       displayCurrentPage();
     }
     if (statsDirty && millis() - lastStatsSave > 600000UL) saveStats();
-    if (millis() - lastActivityTime > INACTIVITY_TIMEOUT_MS) {
+    if (powerLogEnabled && millis() - lastPowerLog >= 10000) {
+      lastPowerLog = millis();
+      logPowerSample();
+    }
+    if (!M5.Power.isCharging() && millis() - lastActivityTime > inactivityTimeoutMs) {
       goToSleep();
     }
   }
+  vTaskDelay(pdMS_TO_TICKS(10));     // do not busy-spin the CPU
 }
 
 void goToSleep() {
+  if (M5.Power.isCharging()) return;   // keep running while on USB
   if (statsDirty) saveStats();
   canvas.fillScreen(BLACK);
   canvas.setTextColor(TFT_WHITE);
@@ -1917,9 +2180,11 @@ void goToSleep() {
   canvas.setFont(&fonts::FreeSans9pt7b);
   canvas.drawString("Going to sleep...", 120, 80);
   canvas.pushSprite(0, 0);
-  delay(3000);
+  delay(500);
+  M5.Display.setBrightness(0);
+  appliedBrightness = 0;
   M5.Display.sleep();
-  M5.Power.deepSleep(DEEP_SLEEP_DURATION_S * 1000000ULL);
+  M5.Power.deepSleep(deepSleepDurationS * 1000000ULL);
 }
 
 // ---------------------------------------------------------------- icons
@@ -1959,7 +2224,7 @@ void drawBatteryStatus() {
     canvas.drawLine(x + 9, y + 8, x + 14, y + 2, TFT_RED);
   }
 
-  if (gpsEnabled && gpsDetected) {   // GPS = live fix, GPS? = module found, no fix yet
+  if (gpsEnabled && (gpsDetected || (gpsPowerOff && gpsEverFix))) {   // GPS = fix, GPS? = no fix yet
     canvas.setFont(&fonts::Font0);
     canvas.setTextColor(uiFg);
     canvas.setTextDatum(TR_DATUM);
@@ -2030,6 +2295,13 @@ void selectNextAircraft() {
 }
 
 void handleButtons() {
+  if (M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnPWR.isPressed()) {
+    lastButtonTime = millis();
+    if (screenDimmed) {
+      screenDimmed = false;
+      setBrightnessLevel(baseBrightness);
+    }
+  }
   if (!isResetting && M5.BtnA.wasPressed()) {
     lastActivityTime = millis();
     if (currentPage != PAGE_MAP) {
@@ -2066,6 +2338,9 @@ void handleButtons() {
     if (!btnCToggled && !configMode) {
       if (currentPage == PAGE_MAP) {
         cycleMapScale();
+        displayCurrentPage();
+      } else if (currentPage == PAGE_MILSTATS) {
+        milPage = (milPage + 1) % milPageCount();   // list types even with no aircraft in range
         displayCurrentPage();
       } else {
         unitsMode = !unitsMode;
@@ -2122,7 +2397,7 @@ void handleButtons() {
     if (isResetting) {
       isResetting = false;       // hold cancelled
       displayCurrentPage();
-    } else if (d < (unsigned long)BTN_B_HOLD_MS && acCount > 1) {
+    } else if (d < (unsigned long)BTN_B_HOLD_MS && acCount > 1 && currentPage != PAGE_MILSTATS) {
       selectNextAircraft();
       displayCurrentPage();
       routeRetryAt = 0;             // manualna zmena vyberu: skus route hned
@@ -2167,6 +2442,8 @@ void startConfigMode() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/log.csv", HTTP_GET, handleLogCsv);
   server.on("/log/clear", HTTP_POST, handleLogClear);
+  server.on("/power.csv", HTTP_GET, handlePowerCsv);
+  server.on("/power/clear", HTTP_POST, handlePowerClear);
   server.on("/update", HTTP_GET, handleOtaPage);
   server.on("/update", HTTP_POST, []() {
     bool ok = !Update.hasError();
@@ -2192,6 +2469,7 @@ void ensureWifi() {
       wifiDownSince = 0;
       wifiBackoff = 0;
       wifiRetryAt = 0;
+      WiFi.setTxPower(wifiTxPower);
       firstPoll = true;             // hned po obnoveni spojenia nacitaj data
     }
     return;
@@ -2214,6 +2492,7 @@ void ensureWifi() {
   Serial.printf("[WIFI] reconnect, next try in %lu s\n", wifiBackoff / 1000);
   WiFi.disconnect();
   WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
+  WiFi.setTxPower(wifiTxPower);
 }
 
 void loadSettingsAndConnect() {
@@ -2240,6 +2519,7 @@ void loadSettingsAndConnect() {
   canvas.drawRect(30, 85, 180, 10, TFT_WHITE);
   canvas.pushSprite(0, 0);
   WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
+  WiFi.setTxPower(wifiTxPower);
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
@@ -2247,6 +2527,7 @@ void loadSettingsAndConnect() {
     canvas.pushSprite(0, 0);
     attempts++;
   }
+  WiFi.setTxPower(wifiTxPower);      // reapply after the interface is up
   if (WiFi.status() != WL_CONNECTED) {
     canvas.fillScreen(TFT_RED);
     canvas.setTextColor(TFT_WHITE);
@@ -2302,7 +2583,8 @@ void handleRoot() {
   lastActivityTime = millis();     // klik na setup stranku resetuje idle timeout
   String html = FPSTR(index_html);
   String lat = "", lon = "", msg;
-  bool gpsPosUsable = gpsEnabled && gpsEverFix && millis() - gpsLastFixMs < 600000UL;
+  bool gpsPosUsable = gpsEnabled && gpsEverFix &&
+                      (gpsPowerOff || millis() - gpsLastFixMs < 600000UL);
   if (gpsPosUsable) {
     lat = String(gpsLat, 6);
     lon = String(gpsLon, 6);
@@ -2311,6 +2593,8 @@ void handleRoot() {
     msg = "GPS is disabled.";
   } else if (gpsDetected) {
     msg = "GPS module found, waiting for a satellite fix. Reload this page in a moment (typed values are lost).";
+  } else if (gpsPowerOff) {
+    msg = "No GPS module detected at boot; using the saved coordinates.";
   } else {
     msg = "No GPS module detected (optional).";
   }
@@ -2327,10 +2611,15 @@ void handleRoot() {
   html.replace("%UA%", htmlEscape(curUa));
   html.replace("%GPSCHK%", gpsEnabled ? "checked" : "");
   html.replace("%LOGCHK%", logEnabled ? "checked" : "");
+  html.replace("%PLOGCHK%", powerLogEnabled ? "checked" : "");
   html.replace("%LOGSIZE%", String(logBytes / 1024));
+  html.replace("%PWRSIZE%", String(powerLogBytes() / 1024));
   html.replace("%GNDCHK%", hideGround ? "checked" : "");
   html.replace("%SELKM%", unitsMode ? "" : " selected");
   html.replace("%SELNM%", unitsMode ? " selected" : "");
+  html.replace("%SELPROF0%", powerProfile == 0 ? " selected" : "");
+  html.replace("%SELPROF1%", powerProfile == 1 ? " selected" : "");
+  html.replace("%SELPROF2%", powerProfile == 2 ? " selected" : "");
   html.replace("%WATCH%", htmlEscape(watchList));
   html.replace("%CPAKM%", String(cpaThresholdKm, 1));
   html.replace("%CPAMIN%", String(cpaThresholdMin));
@@ -2417,6 +2706,10 @@ void handleSave() {
   if (server.hasArg("a_cpa")) flags |= 16;
   if (server.hasArg("a_over")) flags |= 32;
   int radius = (int)(rad + 0.5);
+  int prof = server.arg("profile").toInt();
+  if (prof < 0 || prof > 2) prof = 1;
+  preferences.putInt("profile", prof);
+  preferences.putBool("plog", server.hasArg("plog"));
   preferences.putString("ua", ua);
   preferences.putBool("gps", server.hasArg("gps"));
   preferences.putBool("log", server.hasArg("log"));
@@ -2628,7 +2921,69 @@ void drawStatsPage() {
   }
 }
 
-// Page 11: data quality, source of the position and expert fields
+// Page 11: daily statistics for military aircraft only, grouped by type + country
+bool milTypeBefore(const MilTypeStat& a, const MilTypeStat& b) {
+  if (a.count != b.count) return a.count > b.count;
+  int c = strcmp(a.type, b.type);
+  if (c != 0) return c < 0;
+  return strcmp(a.cc, b.cc) < 0;
+}
+
+void drawMilStatsPage() {
+  uint8_t pages = milPageCount();
+  if (milPage >= pages) milPage = pages - 1;
+
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  canvas.setTextColor(TFT_ORANGE);
+  canvas.setTextDatum(TC_DATUM);
+  canvas.drawString("MIL TODAY", 120, 5);
+
+  if (mil.typeCount == 0) {
+    canvas.setFont(&fonts::FreeSans9pt7b);
+    canvas.setTextColor(TFT_LIGHTGREY);
+    canvas.setTextDatum(MC_DATUM);
+    canvas.drawString("No military today", 120, 70);
+    return;
+  }
+
+  uint8_t order[MIL_TYPE_MAX];
+  for (int i = 0; i < mil.typeCount; i++) order[i] = i;
+  for (int i = 1; i < mil.typeCount; i++) {
+    uint8_t v = order[i];
+    int j = i - 1;
+    while (j >= 0 && milTypeBefore(mil.types[v], mil.types[order[j]])) {
+      order[j + 1] = order[j];
+      j--;
+    }
+    order[j + 1] = v;
+  }
+
+  int start = milPage * MIL_ROWS;
+  for (int r = 0; r < MIL_ROWS; r++) {
+    int idx = start + r;
+    if (idx >= mil.typeCount) break;
+    const MilTypeStat& e = mil.types[order[idx]];
+    int y = 28 + r * 26;
+
+    canvas.setFont(&fonts::FreeSans9pt7b);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.drawString(e.type, 10, y);
+
+    if (e.cc[0]) {
+      canvas.setTextColor(TFT_LIGHTGREY);
+      canvas.setTextDatum(TR_DATUM);
+      canvas.drawString(e.cc, 195, y);
+    }
+
+    canvas.setFont(&fonts::FreeSansBold9pt7b);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString(String((unsigned int)e.count), 232, y);
+  }
+}
+
+// Page 12: data quality, source of the position and expert fields
 void drawDataPage() {
   Aircraft& a = ac[sel];
 
@@ -2696,6 +3051,12 @@ void displayCurrentPage() {
 
   if (currentPage == PAGE_STATS) {
     drawStatsPage();
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
+  if (currentPage == PAGE_MILSTATS) {
+    drawMilStatsPage();
     canvas.pushSprite(0, 0);
     return;
   }
@@ -3074,7 +3435,7 @@ void fetchAircraftData() {
         canvas.setFont(&fonts::FreeSansBold12pt7b);
         canvas.drawString("JSON PARSE ERROR", 120, 67);
         canvas.pushSprite(0, 0);
-        pollInterval = ERROR_POLL_INTERVAL;
+        pollInterval = pollIdleMs > ERROR_POLL_INTERVAL ? pollIdleMs : ERROR_POLL_INTERVAL;
       } else {
         commitScan();
 
@@ -3085,12 +3446,12 @@ void fetchAircraftData() {
           lastNearestHex = ac[0].hex32;
           displayCurrentPage();        // show first, route is fetched in the background
           requestRoute(sel);
-          pollInterval = SHORT_POLL_INTERVAL;
+          pollInterval = pollActiveMs;
         } else {
           Serial.println("[AIRCRAFT] no aircraft found.");
           lastNearestHex = 0;
           displayCurrentPage();
-          pollInterval = NO_AIRCRAFT_POLL_INTERVAL;
+          pollInterval = pollIdleMs;
         }
       }
 
@@ -3114,7 +3475,7 @@ void fetchAircraftData() {
       canvas.drawString("HTTP Code: " + String(httpCode), 120, 80);
       canvas.pushSprite(0, 0);
 
-      pollInterval = ERROR_POLL_INTERVAL;
+      pollInterval = pollIdleMs > ERROR_POLL_INTERVAL ? pollIdleMs : ERROR_POLL_INTERVAL;
     }
 
     http.end();
